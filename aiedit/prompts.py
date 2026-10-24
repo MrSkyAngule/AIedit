@@ -99,15 +99,6 @@ Packages:
 """
 
 
-# добавляется к AGENT_SYSTEM, когда модель видит картинки
-VISION_ADDON = """
-Images:
-- view_image: path - shows you an image file from the project (PNG, JPEG, GIF, WebP).
-- Images the user attached are in section ATTACHED IMAGES of the first message.
-"""
-SEC_IMAGES = "=== ATTACHED IMAGES ==="
-
-
 def agent_system(base: str, addons: list[str]) -> str:
     """Системный промпт агента с разделами про дополнительные инструменты, которые сейчас доступны."""
     extra = "".join(a.lstrip("\n") for a in addons)

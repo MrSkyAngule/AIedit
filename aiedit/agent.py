@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from . import images as pictures, orchestrator, policy, prompts
+from . import orchestrator, policy, prompts
 from .providers import Provider
 from .workspace import Change, Workspace
 
@@ -45,7 +45,6 @@ TOOLS: dict[str, dict] = {
     "edit_file": {"path": str, "old_text": str, "new_text": str},
     "create_file": {"path": str, "content": str},
     "delete_file": {"path": str},
-    "view_image": {"path": str},
     "rename_file": {"path": str, "new_path": str},
     "ask_user": {"question": str},  # не инструмент рабочей области: отвечает человек
     "run_command": {"command": str},  # выполняет редактор, в песочнице (sandbox.Terminal)
@@ -128,7 +127,7 @@ def execute(ws: Workspace, call: Call) -> str:
         return f"ERROR: {call.error}"
     required = {"read_file": ["path"], "search": ["query"], "edit_file": ["path", "old_text", "new_text"],
                 "create_file": ["path", "content"],
-                "delete_file": ["path"], "rename_file": ["path", "new_path"], "view_image": ["path"]}.get(call.name, [])
+                "delete_file": ["path"], "rename_file": ["path", "new_path"]}.get(call.name, [])
     missing = [r for r in required if r not in call.args]
     if missing:
         return f"ERROR: missing arguments: {', '.join(missing)}"
@@ -156,8 +155,6 @@ def describe_call(call: Call) -> str:
         return f"предлагаю удалить {a.get('path', '?')}"
     if call.name == "rename_file":
         return f"предлагаю перенести {a.get('path', '?')} → {a.get('new_path', '?')}"
-    if call.name == "view_image":
-        return f"смотрю картинку {a.get('path', '?')}"
     if call.name == "ask_user":
         return "задаю вопрос"
     if call.name == "run_command":
@@ -199,15 +196,11 @@ def ask_human(call: Call, ask: Callable[[str], str | None] | None, asked: int) -
     return (answer.strip() if answer and answer.strip() else prompts.OUT_NO_ANSWER), True
 
 
-def first_message(task: str, ws: Workspace, open_file: Path | None = None, attached: list[str] | None = None,
-                  vision: bool = True) -> str:
-    """Первое сообщение модели: задача, список файлов проекта, имя открытого файла и приложенные картинки.
-    Модели без картинок вместо них уходят только названия."""
+def first_message(task: str, ws: Workspace, open_file: Path | None = None) -> str:
+    """Первое сообщение модели: задача, список файлов проекта и имя открытого файла."""
     tree = ws.list_files(".", 2)
     opened = f"\n{prompts.SEC_OPEN}\n{ws.rel(open_file)}" if open_file and ws.resolve(str(open_file)) else ""
-    marks = "\n".join(attached or [])
-    pics = f"\n{prompts.SEC_IMAGES}\n{marks if vision else pictures.strip(marks)}" if attached else ""
-    return f"{task}\n\n{prompts.SEC_TREE}\n{tree}{opened}{pics}"
+    return f"{task}\n\n{prompts.SEC_TREE}\n{tree}{opened}"
 
 
 def run(task: str, ws: Workspace, provider: Provider, history: list | None = None,
@@ -216,21 +209,17 @@ def run(task: str, ws: Workspace, provider: Provider, history: list | None = Non
         max_steps: int = MAX_STEPS, system: str | None = None,
         ask: Callable[[str], str | None] | None = None,
         terminal: Callable[[str], str] | None = None, web: Callable[[str], str] | None = None,
-        install: Callable[[str], str] | None = None, attached: list[str] | None = None) -> AgentResult:
+        install: Callable[[str], str] | None = None) -> AgentResult:
     """Крутит цикл: запрос к модели, выполнение инструментов, ответ редактора, пока не будет итога.
     ask(вопрос) -> ответ человека или None; без ask модель не знает про ask_user и решает сама.
     terminal(команда) -> вывод для модели (sandbox.Terminal); без него run_command нет.
     web(адрес) -> текст страницы (web.Web); без него fetch_url нет.
-    install(пакеты) -> вывод pip (packages.Installer). Проверяющему (read_only) помощники не даются.
-    attached - метки картинок, которые приложил человек (images.register)."""
+    install(пакеты) -> вывод pip (packages.Installer). Проверяющему (read_only) помощники не даются."""
     say = on_progress or (lambda _: None)
     stop = should_stop or (lambda: False)
-    vision = bool(getattr(provider, "vision", False))
-    first = first_message(task, ws, open_file, attached, vision)
+    first = first_message(task, ws, open_file)
     messages = orchestrator.build_messages(history, first)
     result = AgentResult("", [])
-    if attached and not vision:
-        result.notes.append(f"{provider.name} не принимает картинки: модель получила только их названия")
     spent = len(first)
     asked = 0
     if ws.read_only:
@@ -238,8 +227,7 @@ def run(task: str, ws: Workspace, provider: Provider, history: list | None = Non
     helpers = {"run_command": terminal, "fetch_url": web, "install_packages": install}
     system = prompts.agent_system(system or SYSTEM, [addon for on, addon in (
         (ask is not None, prompts.ASK_ADDON), (terminal is not None, prompts.TERMINAL_ADDON),
-        (web is not None, prompts.WEB_ADDON), (install is not None, prompts.INSTALL_ADDON),
-        (vision, prompts.VISION_ADDON)) if on])
+        (web is not None, prompts.WEB_ADDON), (install is not None, prompts.INSTALL_ADDON)) if on])
     for step in range(1, max_steps + 1):
         if stop():
             result.stopped = "остановлено пользователем"
@@ -262,8 +250,6 @@ def run(task: str, ws: Workspace, provider: Provider, history: list | None = Non
             if call.name == "ask_user":
                 out, used = ask_human(call, ask, asked)
                 asked += used
-            elif call.name == "view_image" and not vision:
-                out = "ERROR: this model cannot see images"
             elif call.name in HELPED:
                 out = run_helper(call, helpers[call.name])
             else:

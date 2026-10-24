@@ -59,10 +59,7 @@ you see it. Nothing is written to disk without your approval.
 | `run_command` | run tests or the program | sandbox, your approval (below) |
 | `fetch_url` | read a documentation page | https only; sites outside your list need approval |
 | `install_packages` | ask to `pip install` into `.venv` | your approval every time; PyPI names only; prebuilt wheels only, so no package code runs on install |
-| `view_image` | look at an image in the project | only for models that accept images |
 | `ask_user` | ask you when the task is unclear | |
-
-You can also attach a screenshot to a message (button or Ctrl+V in the input box).
 
 **Rollback.** Before applying the agent's edits the editor saves how the files looked. Any applied
 run can be rolled back from the menu, including created and deleted files and the zones. Rollback
@@ -146,7 +143,6 @@ The suite runs on both PyQt6 and PySide6 and uses fake providers and local HTTP 
   local processes; only the agent's commands go through the sandbox. The sandbox is Linux-only.
 - In the sandbox, code inside closed zones does not run, and lines that look like secrets are
   removed even if the secret is fake. Code that depends on them fails there.
-- Images are sent to the model as they are: the outbound filter cannot read text in pictures.
 - Web pages are untrusted input. The model is told not to follow instructions from them, but that
   is a request, not a lock. A page cannot reach your files: it only becomes text for the model.
 

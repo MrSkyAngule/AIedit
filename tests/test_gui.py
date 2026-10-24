@@ -1794,60 +1794,6 @@ class InstallGuiTest(GuiCase):
         self.assertFalse(settings.get_user()["install"])
 
 
-class ImageGuiTest(GuiCase):
-    PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 20
-
-    def agent(self, replies):
-        w = self.window()
-        prov = Script(replies)
-        prov.vision = True
-        w.providers = {"cheap": prov, "strong": prov}
-        return w, prov
-
-    def test_attached_image_goes_with_next_message_only(self):
-        from aiedit import images
-        w, prov = self.agent(["вижу", "ок"])
-        w.add_image(self.PNG, "ошибка.png")
-        self.assertIn("ошибка.png", w.chat.attach_label.text())
-        self.assertIn("не читает картинки", w.chat.history.toPlainText())
-        w.ask_ai("что на скриншоте?")
-        self.wait(w)
-        first = prov.seen[0][0]["content"]
-        self.assertEqual([images.name_of(m) for m in images.marks_in(first)], ["ошибка.png"])
-        self.assertIn("[картинка: ошибка.png]", w.chat.history.toPlainText())
-        self.assertFalse(w.chat.attach_row.isVisibleTo(w.chat))
-        self.assertTrue(any(e.get("mode") == "image" for e in sendlog.read(self.root)))
-        w.ask_ai("а теперь?")
-        self.wait(w)
-        self.assertEqual(images.marks_in(prov.seen[1][-1]["content"]), [])  # второй раз картинка не уходит
-
-    def test_paste_screenshot_from_clipboard(self):
-        from aiedit.qt import QImage
-        import importlib
-        from aiedit.qt import BINDING
-        QMimeData = importlib.import_module(f"{BINDING}.QtCore").QMimeData
-        w, _ = self.agent([])
-        img = QImage(4, 4, QImage.Format.Format_RGB32)
-        img.fill(0)
-        mime = QMimeData()
-        mime.setImageData(img)
-        self.assertTrue(w.chat.input.canInsertFromMimeData(mime))
-        w.chat.input.insertFromMimeData(mime)
-        self.assertEqual([n for _, n in w.chat.attached], ["скриншот 1.png"])
-        self.assertEqual(w.chat.input.toPlainText(), "")
-
-    def test_bad_file_and_single_file_mode(self):
-        w, _ = self.agent([])
-        w.add_image(b"text", "x.txt")
-        self.assertEqual(w.chat.attached, [])
-        self.assertIn("картинку не приложить", w.chat.history.toPlainText())
-        w.add_image(self.PNG, "a.png")
-        w.tree.root = None
-        w.ask_ai("смотри")
-        self.assertIn("картинки работают в режиме проекта", w.chat.history.toPlainText())
-        self.assertEqual(len(w.chat.attached), 1)  # не пропали
-
-
 class TerminalGuiTest(GuiCase):
     def setUp(self):
         super().setUp()

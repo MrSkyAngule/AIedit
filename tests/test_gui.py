@@ -10,7 +10,7 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 try:
-    from aiedit.qt import QApplication, QInputDialog, QTextDocument
+    from aiedit.qt import QApplication, QInputDialog, Qt, QTextDocument
 except ImportError:  # нет Qt - тесты окна пропускаем
     QApplication = None
 
@@ -1849,6 +1849,73 @@ class SearchGuiTest(GuiCase):
         w.act_web.setChecked(False)
         w.toggle_web()
         self.assertIsNone(w.make_searcher())
+
+
+class ActivityBarGuiTest(GuiCase):
+    def setUp(self):
+        super().setUp()
+        from tests.test_gitops import IDENT
+        self.saved_ident = {k: os.environ.get(k) for k in IDENT}
+        os.environ.update(IDENT)
+
+    def tearDown(self):
+        for k, v in self.saved_ident.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        super().tearDown()
+
+    def test_icons_toggle_panels_and_left_side_is_one_at_a_time(self):
+        w = self.window()
+        w.show()
+        app.processEvents()
+        self.assertEqual(set(w.side_actions), {"files", "git", "chat"})
+        self.assertFalse(w.side_actions["files"].icon().isNull())
+        w.side_actions["git"].trigger()
+        app.processEvents()
+        self.assertTrue(w.git_dock.isVisible())
+        self.assertFalse(w.files_dock.isVisible())
+        self.assertFalse(w.side_actions["files"].isChecked())
+        w.side_actions["chat"].trigger()
+        app.processEvents()
+        self.assertFalse(w.chat_dock.isVisible())
+        self.assertTrue(w.git_dock.isVisible())  # чат слева ничего не прячет
+        w.side_actions["files"].trigger()
+        app.processEvents()
+        self.assertTrue(w.files_dock.isVisible())
+        self.assertFalse(w.git_dock.isVisible())
+
+    def test_git_panel_init_diff_and_commit(self):
+        from aiedit import gitops
+        w = self.window()
+        self.assertTrue(w.git.init_btn.isVisibleTo(w.git))
+        self.assertIn("не под git", w.git.head.text())
+        w.git.init_repo()
+        self.assertIn("создан git-репозиторий", w.chat.history.toPlainText())
+        names = [e.path for e in w.git.entries]
+        self.assertIn("a.py", names)
+        self.assertEqual(w.git.files.item(names.index("a.py")).checkState(), Qt.CheckState.Checked)
+        shown = []
+        w.git.diffRequested.disconnect()
+        w.git.diffRequested.connect(lambda name, old, new: shown.append((name, old, new)))
+        w.git.show_diff(w.git.files.item(names.index("b.py")))
+        self.assertEqual(shown, [("b.py", None, "y = 2\n")])
+        w.git.msg.setPlainText("первый коммит")
+        w.git.commit()
+        self.assertIn("закоммичено файлов", w.chat.history.toPlainText())
+        self.assertEqual([e.path for e in gitops.status(self.root)], [".aiedit-chat.json"])  # чат не закоммичен
+        self.assertEqual(w.git.msg.toPlainText(), "")
+
+    def test_private_editor_files_are_unchecked(self):
+        from aiedit import gitops
+        gitops.init(self.root)
+        (self.root / ".aiedit-sends.jsonl").write_text("{}\n")
+        w = self.window()
+        w.git.refresh()
+        row = [e.path for e in w.git.entries].index(".aiedit-sends.jsonl")
+        self.assertEqual(w.git.files.item(row).checkState(), Qt.CheckState.Unchecked)
+        self.assertIn("служебный", w.git.files.item(row).text())
 
 
 class TerminalGuiTest(GuiCase):

@@ -51,6 +51,25 @@ def confirm_diff(parent, old: str, new: str, notes: list[str] | None = None,
     return bool(dlg.exec())
 
 
+def show_diff(parent, title: str, old: str, new: str) -> QDialog:
+    """Дифф только для чтения (без «применить»). Не блокирует окно."""
+    dlg = QDialog(parent)
+    dlg.setWindowTitle(title)
+    dlg.resize(820, 560)
+    view = QTextEdit()
+    view.setReadOnly(True)
+    view.setFont(QFont("monospace", 10))
+    view.setHtml(diff_html(old, new) or "<i>различий нет</i>")
+    close = QPushButton("Закрыть")
+    close.clicked.connect(dlg.accept)
+    lay = QVBoxLayout(dlg)
+    lay.addWidget(view)
+    lay.addWidget(close)
+    dlg.view = view
+    dlg.open()
+    return dlg
+
+
 def show_text(parent, title: str, text: str, width: int = 760, height: int = 560) -> QDialog:
     dlg = QDialog(parent)
     dlg.setWindowTitle(title)

@@ -6,7 +6,9 @@ import threading
 from pathlib import Path
 
 from .searchdialog import SearchDialog
-from .qt import (BINDING, QAction, QApplication, QDockWidget, QFileDialog, QKeySequence,
+from . import icons
+from .gitpanel import GitPanel
+from .qt import (BINDING, QAction, QApplication, QDockWidget, QFileDialog, QKeySequence, QSize, QToolBar,
                  QInputDialog, QMainWindow, QMessageBox, Qt, QTabWidget, QTextCursor, QThread, QTimer, QVBoxLayout, QWidget,
                  Signal)
 from . import (agent, analysis, checkpoints, checks, journal, project_rules, conductor, flows, prompts, dialogs, guard, orchestrator, outbound, policy, related,
@@ -185,14 +187,56 @@ class MainWindow(QMainWindow):
         self.tree.pathDeleted.connect(self.on_path_deleted)
         self.tree.rootChanged.connect(lambda name: self.load_chat(Path(name)))
         self.tree.rootChanged.connect(lambda name: self.load_check_settings(Path(name)))
-        files_dock = QDockWidget("Файлы", self)
+        self.files_dock = files_dock = QDockWidget("Файлы", self)
         files_dock.setWidget(self.tree)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, files_dock)
+        self.git = GitPanel()
+        self.git.diffRequested.connect(lambda name, old, new: dialogs.show_diff(
+            self, f"{name}: последний коммит и сейчас", old or "", new))
+        self.git.message.connect(self.say)
+        self.tree.rootChanged.connect(lambda name: self.git.set_root(Path(name)))
+        self.git_dock = QDockWidget("Git", self)
+        self.git_dock.setWidget(self.git)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.git_dock)
+        self.git_dock.hide()
+        self.build_activity_bar()
 
         self.build_menus()
         self.add_doc()
         self.refresh_access()
         self.show_models_in_status()
+
+    # --- боковая полоса с иконками ---
+    def build_activity_bar(self):
+        """Слева, как в VS Code: файлы и git делят одно место, чат справа живёт сам по себе."""
+        bar = QToolBar("Панели", self)
+        bar.setMovable(False)
+        bar.setIconSize(QSize(26, 26))
+        self.addToolBar(Qt.ToolBarArea.LeftToolBarArea, bar)
+        self.side_actions = {}
+        for key, icon, text, dock in (("files", icons.files(), "Файлы", self.files_dock),
+                                      ("git", icons.git(), "Git", self.git_dock),
+                                      ("chat", icons.chat(), "Чат с ИИ", self.chat_dock)):
+            act = QAction(icon, text, self)
+            act.setCheckable(True)
+            act.setChecked(dock.isVisible() if key != "git" else False)
+            act.triggered.connect(lambda checked, k=key: self.toggle_panel(k, checked))
+            dock.visibilityChanged.connect(lambda visible, a=act, d=dock: a.setChecked(d.isVisible()))
+            bar.addAction(act)
+            self.side_actions[key] = act
+        self.activity_bar = bar
+
+    def toggle_panel(self, key: str, show: bool):
+        docks = {"files": self.files_dock, "git": self.git_dock, "chat": self.chat_dock}
+        dock = docks[key]
+        if show and key in ("files", "git"):  # слева одна панель за раз
+            other = docks["git" if key == "files" else "files"]
+            other.hide()
+        dock.setVisible(show)
+        if show and key == "git":
+            self.git.refresh()
+        if show:
+            dock.raise_()
 
     # --- меню ---
     def action(self, menu, text, slot, shortcut=None):
@@ -806,6 +850,7 @@ class MainWindow(QMainWindow):
         doc.save()
         self.set_tab_label(doc)
         self.statusBar().showMessage(f"сохранено: {doc.path}", 3000)
+        self.refresh_git()
 
     def save_as(self):
         name, _ = QFileDialog.getSaveFileName(self, "Сохранить как")
@@ -1668,10 +1713,15 @@ class MainWindow(QMainWindow):
             self.say(f"не применено: {line}")
         if done:
             self.say("применено: " + ", ".join(done))
+        self.refresh_git()
         if not done and not skipped:
             self.say("правки отклонены")
             return prompts.OUT_USER_REJECT_ALL
         return prompts.outcome_applied(done, skipped_en)
+
+    def refresh_git(self):
+        if self.git_dock.isVisible():
+            self.git.refresh()
 
     def make_ws_label(self, path: Path) -> str:
         try:
@@ -1780,6 +1830,7 @@ class MainWindow(QMainWindow):
                 failed.append(f"{self.make_ws_label(path)} ({e})")
         checkpoints.forget(self.tree.root, point)
         self.refresh_access()
+        self.refresh_git()
         self.say(f"откачено файлов: {len(point.files) - len(failed)}"
                  + ("; не вышло: " + ", ".join(failed) if failed else ""))
         if self.history:  # модель должна знать, что её правки убраны

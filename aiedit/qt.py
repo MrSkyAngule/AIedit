@@ -36,6 +36,7 @@ QDir, QPoint, QRect, QSize = _core.QDir, _core.QPoint, _core.QRect, _core.QSize
 QSortFilterProxyModel = _core.QSortFilterProxyModel
 Signal = getattr(_core, "pyqtSignal", None) or _core.Signal
 QAction, QColor, QFont, QPainter = _gui.QAction, _gui.QColor, _gui.QFont, _gui.QPainter
+QIcon, QPixmap, QPen, QPainterPath = _gui.QIcon, _gui.QPixmap, _gui.QPen, _gui.QPainterPath
 QFileSystemModel = getattr(_gui, "QFileSystemModel", None) or _widgets.QFileSystemModel
 QKeySequence, QTextCursor, QTextFormat = _gui.QKeySequence, _gui.QTextCursor, _gui.QTextFormat
 QTextCharFormat, QTextDocument = _gui.QTextCharFormat, _gui.QTextDocument
@@ -48,6 +49,7 @@ QCheckBox, QDialog, QHBoxLayout, QLabel = (_widgets.QCheckBox, _widgets.QDialog,
                                            _widgets.QHBoxLayout, _widgets.QLabel)
 QLineEdit, QListWidget, QListWidgetItem = _widgets.QLineEdit, _widgets.QListWidget, _widgets.QListWidgetItem
 QTreeView, QToolButton = _widgets.QTreeView, _widgets.QToolButton
+QToolBar = _widgets.QToolBar
 QTabWidget, QInputDialog = _widgets.QTabWidget, _widgets.QInputDialog
 QComboBox, QGridLayout = _widgets.QComboBox, _widgets.QGridLayout
 QAbstractItemView, QTreeWidget, QTreeWidgetItem = (_widgets.QAbstractItemView, _widgets.QTreeWidget,

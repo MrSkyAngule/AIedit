@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from . import context, orchestrator, policy, prompts
+from . import context, orchestrator, policy, project_rules, prompts
 from .providers import Provider
 from .workspace import Change, Workspace
 
@@ -203,10 +203,10 @@ def ask_human(call: Call, ask: Callable[[str], str | None] | None, asked: int) -
 
 
 def first_message(task: str, ws: Workspace, open_file: Path | None = None) -> str:
-    """Первое сообщение модели: задача, список файлов проекта и имя открытого файла."""
+    """Первое сообщение модели: задача, список файлов проекта, имя открытого файла и правила проекта."""
     tree = ws.list_files(".", 2)
     opened = f"\n{prompts.SEC_OPEN}\n{ws.rel(open_file)}" if open_file and ws.resolve(str(open_file)) else ""
-    return f"{task}\n\n{prompts.SEC_TREE}\n{tree}{opened}"
+    return f"{task}\n\n{prompts.SEC_TREE}\n{tree}{opened}{project_rules.section(ws)}"
 
 
 def run(task: str, ws: Workspace, provider: Provider, history: list | None = None,

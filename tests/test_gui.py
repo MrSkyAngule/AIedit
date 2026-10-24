@@ -1819,6 +1819,18 @@ class LongTaskGuiTest(GuiCase):
         self.assertIn("лимит шагов", w.chat.history.toPlainText())
 
 
+class ProjectRulesGuiTest(GuiCase):
+    def test_menu_creates_and_opens_agents_md(self):
+        w = self.window()
+        w.open_project_rules()
+        self.assertTrue((self.root / "AGENTS.md").is_file())
+        self.assertEqual(w.doc.path.name, "AGENTS.md")
+        self.assertIn("создан AGENTS.md", w.chat.history.toPlainText())
+        (self.root / "AGENTS.md").write_text("уже есть")
+        w.open_project_rules()  # второй раз - просто открывает, не перезаписывает
+        self.assertEqual((self.root / "AGENTS.md").read_text(), "уже есть")
+
+
 class TerminalGuiTest(GuiCase):
     def setUp(self):
         super().setUp()

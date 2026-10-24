@@ -51,6 +51,7 @@ Tools:
 
 Rules:
 - Explore on your own: start from the file list, read only what you need, use search. Never invent paths.
+- Follow the PROJECT RULES section if it is there: the user wrote it for every task in this project.
 - Lines like <<ai-hidden:N:K lines>> are closed code; signatures after | are its interface. You may call it, never change or delete it.
 - Files missing from the list do not exist for you. Do not try to find or bypass them.
 - Edit minimally: @@old must match the file text exactly (indentation included) and occur once.

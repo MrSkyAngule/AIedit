@@ -9,7 +9,7 @@ from .searchdialog import SearchDialog
 from .qt import (BINDING, QAction, QApplication, QDockWidget, QFileDialog, QKeySequence,
                  QInputDialog, QMainWindow, QMessageBox, Qt, QTabWidget, QTextCursor, QThread, QTimer, QVBoxLayout, QWidget,
                  Signal)
-from . import (agent, analysis, checkpoints, checks, journal, conductor, flows, prompts, dialogs, guard, orchestrator, outbound, policy, related,
+from . import (agent, analysis, checkpoints, checks, journal, project_rules, conductor, flows, prompts, dialogs, guard, orchestrator, outbound, policy, related,
                packages, sandbox, secrets_scan, sendlog, settings, web)
 from . import chatstore
 from .chat import ChatPanel
@@ -237,6 +237,7 @@ class MainWindow(QMainWindow):
         self.action(m, "Найти секреты...", self.find_secrets, "Ctrl+Shift+K")
         ai = self.menuBar().addMenu("ИИ")
         self.action(ai, "Поиск по проекту...", self.search_project, "Ctrl+Shift+F")
+        self.action(ai, "Правила проекта для ИИ (AGENTS.md)...", self.open_project_rules)
         self.action(ai, "Добавить импорты файла в контекст", self.add_imports_to_context)
         self.action(ai, "Сбросить контекст", self.clear_context)
         ai.addSeparator()
@@ -1202,6 +1203,23 @@ class MainWindow(QMainWindow):
 
     def decide_web(self, url: str, found: list[str]) -> str:
         return self.in_window(self.approve_web, url, found)
+
+    # --- правила проекта ---
+    def open_project_rules(self):
+        """Открывает файл правил проекта; если его нет - создаёт по шаблону."""
+        root = self.tree.root
+        if root is None:
+            self.say("сначала открой папку проекта: правила у каждого проекта свои")
+            return
+        path = next((root / n for n in project_rules.NAMES if (root / n).is_file()), root / project_rules.NAMES[0])
+        if not path.exists():
+            try:
+                path.write_text(project_rules.TEMPLATE, encoding="utf-8")
+            except OSError as e:
+                self.say(f"не удалось создать {path.name}: {e}")
+                return
+            self.say(f"создан {path.name}: ИИ будет читать его перед каждой задачей. Пиши коротко")
+        self.load(path)
 
     # --- длинные задачи ---
     def decide_extend(self, steps: int, sent: int) -> bool:

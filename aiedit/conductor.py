@@ -10,7 +10,7 @@ from pathlib import Path
 
 from typing import Callable
 
-from . import agent, analysis, orchestrator, policy, prompts, review as security
+from . import agent, analysis, orchestrator, policy, project_rules, prompts, review as security
 from .outbound import SendCancelled
 from .providers import Provider
 from .roster import Roster, Worker
@@ -71,12 +71,12 @@ class Plan:
 
 
 def build_request(task: str, ws: Workspace, roster: Roster, open_file: Path | None = None) -> str:
-    """Сообщение дирижёру: задача, исполнители, защищённые файлы, дерево проекта."""
+    """Сообщение дирижёру: задача, исполнители, защищённые файлы, дерево проекта, правила проекта."""
     overview = ws.protected_overview() or prompts.NONE
     tree = ws.list_files(".", 2)
     opened = f"\nOPEN FILE: {ws.rel(open_file)}" if open_file and ws.resolve(str(open_file)) else ""
     return (f"REQUEST:\n{task}\n\nWORKERS:\n{roster.describe()}\n\nPROTECTED (zones):\n{overview}\n\n"
-            f"PROJECT FILES (2 levels):\n{tree}{opened}")
+            f"PROJECT FILES (2 levels):\n{tree}{opened}{project_rules.section(ws, 'PROJECT RULES ({name}):')}")
 
 
 def _fields(block: str) -> dict[str, str]:

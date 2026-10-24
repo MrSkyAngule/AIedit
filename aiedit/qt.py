@@ -22,7 +22,8 @@ def _pick() -> str:
             return pkg
         except ImportError:
             continue
-    raise ImportError(f"не найден Qt-биндинг: {', '.join(order)}")
+    raise ImportError(f"не найден Qt-биндинг: {', '.join(order)}. "
+                      "Установите его: pip install PySide6 (или PyQt6)")
 
 
 BINDING = _pick()

@@ -68,11 +68,21 @@ OUT_ASK_UNAVAILABLE = "Nobody can answer here. Decide yourself and state your as
 OUT_ASK_LIMIT = "Question limit reached. Decide yourself and state your assumptions in your final answer."
 
 
-def agent_system(base: str, can_ask: bool) -> str:
-    """Системный промпт агента: с инструментом ask_user, только если есть кому отвечать."""
-    if not can_ask:
-        return base
-    return base.removesuffix(REPLY_LANGUAGE) + ASK_ADDON.lstrip("\n") + REPLY_LANGUAGE
+# добавляется к AGENT_SYSTEM, когда включён терминал в песочнице
+TERMINAL_ADDON = """
+Terminal:
+- run_command: command - runs a shell command in a sandbox and returns its exit code and output. The user approves each command.
+- The sandbox is a copy of the project with your proposed edits already applied. No network, nothing outside the project. Closed code is not there: interface functions raise NotImplementedError, hidden code is gone.
+- Use it to check your work: run the tests or the program after editing, read the errors, fix, run again.
+- Files the command changes are thrown away. Change files only with edit_file and create_file.
+- Installing packages is impossible (no network). If something is missing, tell the user.
+"""
+
+
+def agent_system(base: str, can_ask: bool, can_run: bool = False) -> str:
+    """Системный промпт агента: ask_user - если есть кому отвечать, run_command - если включён терминал."""
+    extra = (ASK_ADDON.lstrip("\n") if can_ask else "") + (TERMINAL_ADDON.lstrip("\n") if can_run else "")
+    return base.removesuffix(REPLY_LANGUAGE) + extra + REPLY_LANGUAGE if extra else base
 
 # --- разделы сообщений ---
 SEC_ZONES = "=== ZONES ==="

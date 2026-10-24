@@ -9,7 +9,7 @@ from .qt import (BINDING, QAction, QApplication, QDockWidget, QFileDialog, QKeyS
                  QInputDialog, QMainWindow, QMessageBox, Qt, QTabWidget, QTextCursor, QThread, QTimer, QVBoxLayout, QWidget,
                  Signal)
 from . import (agent, analysis, checks, journal, conductor, flows, prompts, dialogs, guard, orchestrator, outbound, policy, related,
-               secrets_scan, sendlog, settings)
+               sandbox, secrets_scan, sendlog, settings)
 from . import chatstore
 from .chat import ChatPanel
 from .document import Doc
@@ -45,11 +45,12 @@ class AgentWorker(QThread):
     """Крутит агента в отдельном потоке. Отмена проверяется между шагами и пока ждём ответа человека."""
     progress = Signal(str)
     question = Signal(str)
+    command_done = Signal(object)  # checks.CheckResult команды из песочницы - показать человеку
     done = Signal(object)
     failed = Signal(str)
 
     def __init__(self, task, ws, provider, history, open_file, translator=None, roster=None,
-                 conduct=False, review_on=False, analyze_on=False):
+                 conduct=False, review_on=False, analyze_on=False, approve_command=None):
         super().__init__()
         self.args = (task, ws, provider, history, open_file)
         self.translator = translator
@@ -60,6 +61,9 @@ class AgentWorker(QThread):
         self.cancel = False
         self.answer: str | None = None
         self.answered = threading.Event()
+        # терминал в песочнице, если человек его включил: approve_command спрашивает про каждую команду
+        self.terminal = (sandbox.Terminal(ws, approve_command, self.command_done.emit)
+                         if approve_command is not None else None)
 
     def ask(self, question: str) -> str | None:
         """Вопрос модели человеку: показываем в окне и ждём ответа. None - остановили, не дождавшись."""
@@ -77,19 +81,24 @@ class AgentWorker(QThread):
             if self.conduct:
                 result = flows.run_conductor(task, ws, self.roster, provider, history, open_file, self.translator,
                                              on_progress=self.progress.emit, should_stop=lambda: self.cancel,
-                                             review_on=self.review_on, analyze_on=self.analyze_on, ask=self.ask)
+                                             review_on=self.review_on, analyze_on=self.analyze_on, ask=self.ask,
+                                             terminal=self.terminal)
             else:
                 result = flows.run_agent(task, ws, provider, history, open_file, self.translator,
                                          on_progress=self.progress.emit, should_stop=lambda: self.cancel,
                                          roster=self.roster, review_on=self.review_on, analyze_on=self.analyze_on,
-                                         ask=self.ask)
+                                         ask=self.ask, terminal=self.terminal)
             self.done.emit(result)
         except Exception as e:  # доступ закрыли по ходу работы, сеть, формат ответа
             self.failed.emit(f"{type(e).__name__}: {e}")
+        finally:
+            if self.terminal is not None:
+                self.terminal.close()
 
 
 class MainWindow(QMainWindow):
     outboundAsk = Signal(object)  # вопрос фильтра исходящего из рабочего потока в окно
+    commandAsk = Signal(object)   # вопрос «выполнить команду?» из рабочего потока в окно
 
     def __init__(self):
         super().__init__()
@@ -97,6 +106,8 @@ class MainWindow(QMainWindow):
         self.gate = outbound.Gate(user.get("outbound_words", []), self.decide_outbound, self.log_filter,
                                   bool(user.get("outbound", True)))
         self.outboundAsk.connect(self.answer_outbound, Qt.ConnectionType.BlockingQueuedConnection)
+        self.commandAsk.connect(self.answer_command, Qt.ConnectionType.BlockingQueuedConnection)
+        self.terminal_on = bool(user.get("terminal", True))
         self.translator: Translator | None = None
         self.setup_ai(self.current_setup())
         self.conductor_on = bool(settings.get_user().get("conductor", True))
@@ -223,6 +234,11 @@ class MainWindow(QMainWindow):
         self.act_outbound.setCheckable(True)
         self.act_outbound.setChecked(self.gate.enabled)
         self.action(ai, "Слова для фильтра исходящего...", self.edit_outbound_words)
+        self.act_terminal = self.action(ai, "Терминал для ИИ (песочница, каждая команда с подтверждением)",
+                                        self.toggle_terminal)
+        self.act_terminal.setCheckable(True)
+        self.refresh_terminal_action()
+        self.action(ai, "Разрешённые без вопроса команды...", self.edit_allowed_commands)
         ai.addSeparator()
         self.act_translate = self.action(ai, "Переводить задачи и ответы", self.toggle_translate)
         self.act_translate.setCheckable(True)
@@ -1063,6 +1079,85 @@ class MainWindow(QMainWindow):
         self.say(f"слов в фильтре: {len(self.gate.words)}"
                  + (f"; пропущено слишком коротких: {short}" if short > 0 else ""))
 
+    # --- терминал в песочнице ---
+    def terminal_active(self) -> bool:
+        return self.terminal_on and not sandbox.available()
+
+    def refresh_terminal_action(self):
+        problem = sandbox.available()
+        self.act_terminal.setEnabled(not problem)
+        self.act_terminal.setChecked(self.terminal_active())
+        self.act_terminal.setToolTip(problem)
+
+    def toggle_terminal(self):
+        self.terminal_on = self.act_terminal.isChecked()
+        settings.set_user(terminal=self.terminal_on)
+        self.say("терминал для ИИ включён: команды идут в песочнице на копии проекта без закрытого кода и без сети, "
+                 "каждую ты одобряешь" if self.terminal_on else
+                 "терминал для ИИ выключен: агент проверяет работу только чтением кода")
+
+    def allowed_commands(self) -> list[str]:
+        root = self.tree.root
+        return list(settings.get_project(root).get("allowed_commands", [])) if root else []
+
+    def edit_allowed_commands(self):
+        root = self.tree.root
+        if root is None:
+            self.say("сначала открой папку проекта: список разрешённых команд у каждого проекта свой")
+            return
+        text, ok = QInputDialog.getMultiLineText(
+            self, "Разрешённые без вопроса команды",
+            "Программы по одной на строке, например pytest или python.\n"
+            "Без вопроса выполняются только простые команды: без ;, |, $(...) и перенаправлений.\n"
+            "Список хранится в настройках пользователя, не в проекте.", "\n".join(self.allowed_commands()))
+        if ok:
+            words = sorted({w.strip() for w in text.split("\n") if w.strip()})
+            settings.set_project(root, allowed_commands=words)
+            self.say("без вопроса: " + (", ".join(words) if words else "ничего, спрашивать про каждую команду"))
+
+    def decide_command(self, command: str) -> str:
+        """Из потока агента: run или deny. Окно - только в главном потоке."""
+        if QThread.currentThread() == self.thread():
+            return self.approve_command(command)
+        box = {"command": command, "answer": "deny"}
+        self.commandAsk.emit(box)  # ждёт ответа человека
+        return box["answer"]
+
+    def answer_command(self, box: dict):
+        box["answer"] = self.approve_command(box["command"])
+
+    def approve_command(self, command: str) -> str:
+        if sandbox.preapproved(command, self.allowed_commands()):
+            return "run"
+        choice = self.ask_command(command, sandbox.program(command))
+        if choice == "always":
+            name = sandbox.program(command)
+            if self.tree.root is not None and name:
+                settings.set_project(self.tree.root, allowed_commands=sorted({*self.allowed_commands(), name}))
+                self.say(f"«{name}» теперь выполняется без вопроса (ИИ - Разрешённые без вопроса команды...)")
+            return "run"
+        return "run" if choice == "run" else "deny"
+
+    def ask_command(self, command: str, name: str | None) -> str:
+        """run, always или deny."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Команда от ИИ")
+        box.setText(f"ИИ хочет выполнить:\n\n{command}")
+        box.setInformativeText("Команда выполнится в песочнице: на копии проекта с его правками, без закрытого "
+                               "кода, без сети, без доступа к остальным файлам. Твои файлы она не изменит.")
+        run = box.addButton("Выполнить", QMessageBox.ButtonRole.AcceptRole)
+        always = box.addButton(f"Всегда разрешать «{name}»", QMessageBox.ButtonRole.YesRole) if name else None
+        box.addButton("Отказать", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(run)
+        box.exec()
+        clicked = box.clickedButton()
+        return "run" if clicked is run else "always" if always is not None and clicked is always else "deny"
+
+    def show_command(self, res: checks.CheckResult):
+        self.chat.add("check", checks.tail(res.output.strip()) or "(вывода нет)",
+                      f"песочница · {res.status()} · {res.seconds:.1f} с · {res.command}")
+
     def closed_code_lines(self) -> set[str]:
         """Строки закрытого кода в открытых файлах, кроме сигнатур interface: их модель и так видит."""
         out = set()
@@ -1277,9 +1372,11 @@ class MainWindow(QMainWindow):
         self.watch_task(task)
         self.worker = AgentWorker(task, self.make_workspace(), self.gate.wrap(provider), list(self.history), self.path,
                                   self.active_translator(), self.gate.wrap_roster(self.roster), self.conductor_on,
-                                  self.review_active(), self.analyze_on)
+                                  self.review_active(), self.analyze_on,
+                                  self.decide_command if self.terminal_active() else None)
         self.worker.progress.connect(self.say)
         self.worker.question.connect(self.on_question)
+        self.worker.command_done.connect(self.show_command)
         self.worker.done.connect(self.on_agent_done)
         self.worker.failed.connect(self.on_fail)
         self.worker.start()

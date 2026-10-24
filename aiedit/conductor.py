@@ -220,10 +220,11 @@ def summarize(plan: Plan, results: list[TaskResult]) -> str:
 def run(task: str, ws: Workspace, roster: Roster, conductor: Provider, history: list | None = None,
         open_file: Path | None = None, on_progress: Callable[[str], None] | None = None,
         should_stop: Callable[[], bool] | None = None, english_reply: bool = False,
-        review_on: bool = True, analyze_on: bool = True, ask=None) -> ConductResult:
+        review_on: bool = True, analyze_on: bool = True, ask=None, terminal=None) -> ConductResult:
     """План от дирижёра, затем шаги по порядку у назначенных исполнителей на общей рабочей области.
     Потом, если подключён проверяющий, он смотрит все правки, а серьёзные замечания уходят их авторам.
-    ask - вопрос человеку: исполнитель может переспросить посреди своего шага."""
+    ask - вопрос человеку: исполнитель может переспросить посреди своего шага.
+    terminal - песочница для команд, общая для всех шагов (копия с правками предыдущих шагов)."""
     say = on_progress or (lambda _: None)
     stop = should_stop or (lambda: False)
     say("дирижёр составляет план...")
@@ -259,7 +260,8 @@ def run(task: str, ws: Workspace, roster: Roster, conductor: Provider, history: 
         try:
             r = agent.run(task_prompt(task, plan, t, index, results), ws, worker.provider, None, open_file,
                           on_progress=lambda note, tid=t.id: say(f"{tid}: {note}"), should_stop=should_stop,
-                          english_reply=english_reply, max_steps=min(agent.MAX_STEPS, left), ask=ask)
+                          english_reply=english_reply, max_steps=min(agent.MAX_STEPS, left), ask=ask,
+                          terminal=terminal)
         except (policy.AccessDenied, SendCancelled):
             raise
         except Exception as e:  # сбой одного исполнителя не должен ронять весь план

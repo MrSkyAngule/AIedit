@@ -45,6 +45,7 @@ TOOLS: dict[str, dict] = {
     "edit_file": {"path": str, "old_text": str, "new_text": str},
     "create_file": {"path": str, "content": str},
     "ask_user": {"question": str},  # не инструмент рабочей области: отвечает человек
+    "run_command": {"command": str},  # выполняет редактор, в песочнице (sandbox.Terminal)
 }
 _SECTION_ARG = {"old": "old_text", "new": "new_text", "content": "content", "question": "question"}
 
@@ -147,7 +148,17 @@ def describe_call(call: Call) -> str:
         return f"предлагаю новый файл {a.get('path', '?')}"
     if call.name == "ask_user":
         return "задаю вопрос"
+    if call.name == "run_command":
+        return f"запускаю в песочнице: {a.get('command', '?')[:120]}"
     return call.name
+
+
+def run_terminal(call: Call, terminal: Callable[[str], str] | None) -> str:
+    if call.error:
+        return f"ERROR: {call.error}"
+    if terminal is None:
+        return "ERROR: no terminal here. Check your work by reading the code instead."
+    return terminal(call.args.get("command", ""))
 
 
 def ask_human(call: Call, ask: Callable[[str], str | None] | None, asked: int) -> tuple[str, bool]:
@@ -176,9 +187,11 @@ def run(task: str, ws: Workspace, provider: Provider, history: list | None = Non
         open_file: Path | None = None, on_progress: Callable[[str], None] | None = None,
         should_stop: Callable[[], bool] | None = None, english_reply: bool = False,
         max_steps: int = MAX_STEPS, system: str | None = None,
-        ask: Callable[[str], str | None] | None = None) -> AgentResult:
+        ask: Callable[[str], str | None] | None = None,
+        terminal: Callable[[str], str] | None = None) -> AgentResult:
     """Крутит цикл: запрос к модели, выполнение инструментов, ответ редактора, пока не будет итога.
-    ask(вопрос) -> ответ человека или None; без ask модель не знает про ask_user и решает сама."""
+    ask(вопрос) -> ответ человека или None; без ask модель не знает про ask_user и решает сама.
+    terminal(команда) -> вывод для модели (sandbox.Terminal); без него run_command нет."""
     say = on_progress or (lambda _: None)
     stop = should_stop or (lambda: False)
     first = first_message(task, ws, open_file)
@@ -186,7 +199,7 @@ def run(task: str, ws: Workspace, provider: Provider, history: list | None = Non
     result = AgentResult("", [])
     spent = len(first)
     asked = 0
-    system = prompts.agent_system(system or SYSTEM, ask is not None)
+    system = prompts.agent_system(system or SYSTEM, ask is not None, terminal is not None and not ws.read_only)
     for step in range(1, max_steps + 1):
         if stop():
             result.stopped = "остановлено пользователем"
@@ -209,6 +222,8 @@ def run(task: str, ws: Workspace, provider: Provider, history: list | None = Non
             if call.name == "ask_user":
                 out, used = ask_human(call, ask, asked)
                 asked += used
+            elif call.name == "run_command":
+                out = run_terminal(call, None if ws.read_only else terminal)
             else:
                 out = execute(ws, call)
             spent += len(out)

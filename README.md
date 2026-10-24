@@ -53,6 +53,18 @@ to the model: they are missing from listings, search and reads.
 zone and path filters; every proposed edit is checked against the zones by a diff before
 you see it. Nothing is written to disk without your approval.
 
+**Terminal in a sandbox (Linux).** The agent can run commands (`pytest`, the program itself) to
+check its work, but the editor runs them, not the model:
+
+- each command needs your approval (simple commands like `pytest` can be allowed once and for all);
+- it runs under bubblewrap on a copy of the project with the agent's proposed edits applied;
+- the copy holds only what the model may see: closed files are absent, `interface` functions keep
+  their signatures but raise `NotImplementedError`, `hidden` code and secret lines are gone;
+- no network, no home directory, an empty environment (no API keys), a time limit;
+- whatever the command changes stays in the copy and is thrown away.
+
+So even a command that prints every file in base64 cannot leak closed code: it is not there.
+
 **Asks instead of guessing.** When a task is ambiguous (which file, what behavior, what to do with
 existing data), the agent can call `ask_user`: the work pauses, the question shows up in the chat,
 you answer in the normal input box, and the agent continues with its context intact. At most
@@ -115,7 +127,10 @@ The suite runs on both PyQt6 and PySide6 and uses fake providers and local HTTP 
 - Everything that is not closed is sent to the provider you chose; what they do with it
   is governed by their terms.
 - `interface` works for Python only; other languages fall back to `hidden`.
-- Tests and analyzers you run are ordinary local processes, not sandboxed.
+- Tests and analyzers the editor runs on its own (post-edit check, static analysis) are ordinary
+  local processes; only the agent's commands go through the sandbox. The sandbox is Linux-only.
+- In the sandbox, code inside closed zones does not run, and lines that look like secrets are
+  removed even if the secret is fake. Code that depends on them fails there.
 
 ## Status
 

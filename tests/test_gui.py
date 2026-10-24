@@ -1593,6 +1593,78 @@ class ZonePersistenceTest(GuiCase):
         self.assertNotEqual(side.stat().st_mtime_ns, 1)
 
 
+class TerminalGuiTest(GuiCase):
+    def setUp(self):
+        super().setUp()
+        from aiedit import checks, sandbox
+        self.sandbox = sandbox
+        self.ran = []
+        saved = (sandbox.run_bwrap, sandbox._available)
+
+        def fake(command, work, venv, extra, timeout):
+            self.ran.append((command, (work / "a.py").read_text()))
+            return checks.CheckResult(command, 0, "1 passed", 0.2)
+        sandbox.run_bwrap, sandbox._available = fake, ""  # без настоящей песочницы: проверяем окно
+        self.addCleanup(lambda: setattr(sandbox, "run_bwrap", saved[0]) or setattr(sandbox, "_available", saved[1]))
+
+    def agent(self, replies, answer="run"):
+        w = self.window()
+        prov = Script(replies)
+        w.providers = {"cheap": prov, "strong": prov}
+        w.review_changes = lambda items: [True] * len(items)
+        self.asked = []
+        w.ask_command = lambda command, name: (self.asked.append((command, name)), answer)[1]
+        return w, prov
+
+    def test_command_is_approved_runs_on_copy_with_edits_and_shows_output(self):
+        w, prov = self.agent([edit("a.py", "return 1", "return 11"), call("run_command", command="pytest -q"),
+                              "Тесты прошли."])
+        w.ask_ai("поправь и проверь")
+        self.wait(w)
+        self.assertEqual(self.asked, [("pytest -q", "pytest")])
+        self.assertEqual(len(self.ran), 1)
+        self.assertIn("return 11", self.ran[0][1])  # правка агента уже в копии
+        self.assertIn("@@result run_command\n$ pytest -q\nexit code 0\n1 passed", prov.everything())
+        chat = w.chat.history.toPlainText()
+        self.assertIn("песочница · прошла", chat)
+        self.assertIn("1 passed", chat)
+        self.assertIn("run_command", prov.systems[0])
+
+    def test_always_allow_then_no_question(self):
+        w, prov = self.agent([call("run_command", command="pytest"), call("run_command", command="pytest -x"),
+                              call("run_command", command="pytest; ls"), "ок"], answer="always")
+        w.ask_ai("проверь")
+        self.wait(w)
+        self.assertEqual([c for c, _ in self.asked], ["pytest", "pytest; ls"])  # составную всё равно спросили
+        self.assertEqual(w.allowed_commands(), ["pytest"])
+        self.assertEqual(len(self.ran), 3)
+
+    def test_denied_command_is_reported_to_model(self):
+        w, prov = self.agent([call("run_command", command="rm -rf /"), "ок"], answer="deny")
+        w.ask_ai("сделай")
+        self.wait(w)
+        self.assertEqual(self.ran, [])
+        self.assertIn(self.sandbox.OUT_DECLINED, prov.everything())
+
+    def test_terminal_off_means_no_tool(self):
+        w, prov = self.agent(["ок"])
+        w.act_terminal.setChecked(False)
+        w.toggle_terminal()
+        w.ask_ai("сделай")
+        self.wait(w)
+        self.assertNotIn("run_command", prov.systems[0])
+        self.assertFalse(settings.get_user()["terminal"])
+
+    def test_unavailable_sandbox_disables_menu(self):
+        self.sandbox._available = "песочница пока есть только на Linux"
+        w, prov = self.agent(["ок"])
+        self.assertFalse(w.act_terminal.isEnabled())
+        self.assertFalse(w.terminal_active())
+        w.ask_ai("сделай")
+        self.wait(w)
+        self.assertNotIn("run_command", prov.systems[0])
+
+
 class AskGuiTest(GuiCase):
     def agent(self, replies):
         w = self.window()

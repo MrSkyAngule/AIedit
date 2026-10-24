@@ -109,6 +109,10 @@ The suite runs on both PyQt6 and PySide6 and uses fake providers and local HTTP 
 Early version. All tests pass on offline and fake providers; it has not yet been
 verified end-to-end against real model APIs.
 
+## License
+
+MIT, see [LICENSE](LICENSE). Free to use, including commercially; no warranty.
+
 ## Authorship
 
 Concept, protection model and requirements by MrSkyAngel. Implemented with AI assistance

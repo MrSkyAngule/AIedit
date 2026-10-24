@@ -1,0 +1,31 @@
+stages:
+  - test
+
+variables:
+  QT_QPA_PLATFORM: "offscreen"
+
+# системные библиотеки, без которых Qt не стартует в контейнере
+.qt_libs: &qt_libs
+  - apt-get update -qq
+  - apt-get install -y -qq libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3 libglib2.0-0 > /dev/null
+
+test_pyside6:
+  stage: test
+  image: python:3.12
+  variables:
+    AIEDIT_QT: "pyside6"
+  before_script: *qt_libs
+  script:
+    - pip install -q ".[pyside6]" pyflakes
+    - pyflakes aiedit tests
+    - python -m unittest discover -s tests
+
+test_pyqt6:
+  stage: test
+  image: python:3.10
+  variables:
+    AIEDIT_QT: "pyqt6"
+  before_script: *qt_libs
+  script:
+    - pip install -q ".[pyqt6]"
+    - python -m unittest discover -s tests

@@ -4,6 +4,15 @@ A desktop code editor (Python, PyQt6/PySide6) where AI models work on the whole 
 but never see the parts you closed. The protection is enforced by the editor's code, not by
 asking the model nicely in a prompt.
 
+aiedit makes development with AI easier and safe. The AI writes, runs and checks the code; you
+explain the task, read and understand the changes, and decide what the AI must never see. Closed
+code never leaves your machine, everything that does is logged, and nothing is written without
+your approval.
+
+Everything works together in one editor, not as a set of separate tools to install and wire up:
+line-level zones, the outbound filter, the sandbox, code navigation and review by a model from
+another vendor all know about the same closed code.
+
 > Интерфейс редактора на русском. Everything the editor sends to models is in English.
 
 ## Why

@@ -45,6 +45,8 @@ Tools:
 - search: query, path, case (true/false)
 - edit_file: path, sections @@old and @@new - replaces exactly one occurrence of @@old with @@new
 - create_file: path, section @@content - creates a new file
+- delete_file: path - deletes a file
+- rename_file: path, new_path - moves or renames a file (edit it at the new path afterwards)
 
 Rules:
 - Explore on your own: start from the file list, read only what you need, use search. Never invent paths.

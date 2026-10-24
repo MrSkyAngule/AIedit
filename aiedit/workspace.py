@@ -33,6 +33,7 @@ class FileState:
     live: bool = False  # файл открыт во вкладке (его текст и зоны берутся оттуда)
     confirm: list[str] = field(default_factory=list)
     base_regions: list[Region] = field(default_factory=list)  # зоны для base (до правок)
+    deleted: bool = False  # агент предложил удалить файл (или перенести в другое место)
 
 
 @dataclass
@@ -43,6 +44,7 @@ class Change:
     regions: list[Region]
     needs_confirm: list[str]
     live: bool
+    deleted: bool = False  # new тогда пустой: файл удаляется
 
     @property
     def created(self) -> bool:
@@ -87,7 +89,8 @@ class Workspace:
     def state(self, real: Path) -> FileState | str:
         """Состояние файла или текст ошибки для модели."""
         if real in self.states:
-            return self.states[real]
+            st = self.states[real]
+            return f"ERROR: file not found: {self.rel(real)}" if st.deleted else st
         if not real.exists() or not real.is_file():
             return f"ERROR: file not found: {self.rel(real)}"
         key = str(real)
@@ -146,7 +149,7 @@ class Workspace:
                 return
             for e in entries:
                 real = Path(os.path.realpath(e))
-                if not real.is_relative_to(self.root) or not self.visible(real):
+                if not real.is_relative_to(self.root) or not self.visible(real) or self.pending_delete(real):
                     continue
                 if len(lines) >= MAX_LIST:
                     return
@@ -264,7 +267,12 @@ class Workspace:
         return f"edit accepted: {self.rel(real)}" + (
             f" (needs user confirmation: {', '.join(verdict.needs_confirm_en)})" if verdict.needs_confirm else "")
 
-    def create_file(self, path: str, content: str) -> str:
+    def pending_delete(self, real: Path) -> bool:
+        st = self.states.get(real)
+        return st is not None and st.deleted
+
+    def _new_target(self, path: str) -> Path | str:
+        """Куда можно положить новый файл, или текст ошибки для модели."""
         rel = (path or "").strip()
         if not rel or rel.endswith("/"):
             return "ERROR: a file path is required"
@@ -276,12 +284,64 @@ class Workspace:
         if (policy.is_denied(target) or secrets_scan.suspicious_file(target) or policy.is_private_name(target.name)
                 or any(part in SKIP_DIRS for part in target.relative_to(self.root).parts)):
             return f"ERROR: cannot create a file here: {rel}"
-        if target.exists() or target in self.states:
+        if (target.exists() or target in self.states) and not self.pending_delete(target):
             return f"ERROR: file already exists: {rel} (use edit_file)"
+        return target
+
+    def _put_new(self, target: Path, content: str):
+        st = self.states.get(target)
+        if st is not None and st.deleted:  # удаление отменяется: на этом месте будет новый текст
+            st.deleted, st.text, st.regions = False, content, []
+        else:
+            self.states[target] = FileState(target, content, [], None)
+
+    def create_file(self, path: str, content: str) -> str:
+        target = self._new_target(path)
+        if isinstance(target, str):
+            return target
         if len(content) > MAX_NEW_FILE:
             return "ERROR: file too large"
-        self.states[target] = FileState(target, content, [], None)
+        self._put_new(target, content)
         return f"file will be created: {self.rel(target)}"
+
+    def _movable(self, path: str) -> FileState | str:
+        """Файл, который ИИ может удалить или перенести. Файлы с зонами защиты и секретами - только человек."""
+        real = self.resolve(path)
+        if refused := self._edit_refusal(real):
+            return refused
+        st = self.state(real) if real is not None else f"ERROR: file not found: {path}"
+        if isinstance(st, str):
+            return st
+        levels = sorted({r.level for r in self.view_regions(st)} - {"explain"})
+        if levels:
+            return (f"ERROR: {self.rel(real)} has protected zones ({', '.join(levels)}); "
+                    "only the user can delete or move it. Tell the user if it is needed.")
+        return st
+
+    def delete_file(self, path: str) -> str:
+        st = self._movable(path)
+        if isinstance(st, str):
+            return st
+        if st.base is None:  # создан в этом же запуске: просто забываем
+            del self.states[st.path]
+            return f"new file dropped: {self.rel(st.path)}"
+        st.deleted = True
+        return f"file will be deleted: {self.rel(st.path)}"
+
+    def rename_file(self, path: str, new_path: str) -> str:
+        st = self._movable(path)
+        if isinstance(st, str):
+            return st
+        target = self._new_target(new_path)
+        if isinstance(target, str):
+            return target
+        text = st.text
+        if st.base is None:
+            del self.states[st.path]
+        else:
+            st.deleted = True
+        self._put_new(target, text)
+        return f"file will be moved: {self.rel(st.path)} -> {self.rel(target)} (edit it at the new path)"
 
     def protected_overview(self, limit: int = 30, scan_limit: int = 5000) -> str:
         """Файлы с зонами защиты: по ним дирижёр оценивает риск шагов. Только видимые модели файлы."""
@@ -344,8 +404,8 @@ class Workspace:
 
     # --- набор изменений ---
     def changes(self) -> list[Change]:
-        return [Change(st.path, st.base, st.text, st.regions, st.confirm, st.live)
-                for st in self.states.values() if st.text != st.base]
+        return [Change(st.path, st.base, "" if st.deleted else st.text, st.regions, st.confirm, st.live, st.deleted)
+                for st in self.states.values() if st.deleted or st.text != st.base]
 
 
 def write_change(change: Change) -> None:

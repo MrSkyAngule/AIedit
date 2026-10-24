@@ -16,7 +16,7 @@ from .document import Doc
 from .filetree import FileTree
 from .findbar import FindBar
 from .folder_dialog import FolderDialog
-from .marks import Marks
+from .marks import Marks, sidecar
 from .policy import Rules
 from .translator import Translator
 from .workspace import Workspace, write_change
@@ -1437,7 +1437,8 @@ class MainWindow(QMainWindow):
         self.remember(self.sent_task, res.text or "Готово.", outcome, res.task_en, res.text_en)
         if res.changes and self.applied:
             self.show_journal(self.build_journal(
-                [(name, ch.old, ch.new, "", bool(ch.needs_confirm)) for ch, name in self.applied], res.authors,
+                [(name, ch.old, ch.new, "", bool(ch.needs_confirm)) for ch, name in self.applied
+                 if not ch.deleted], res.authors,  # удалённый файл в журнале открыть уже нельзя
                 (res.analysis, res.review)))
         if res.changes and outcome.startswith("edits applied: ") and not outcome.startswith("edits applied: none") and self.check_cfg.get("auto") and self.check_cfg.get("test_command"):
             QTimer.singleShot(0, self.run_check_after_ai)
@@ -1462,6 +1463,7 @@ class MainWindow(QMainWindow):
     def apply_changes(self, changes, report=None, analysis_report=None) -> str:
         """Показывает набор правок и применяет выбранные. Возвращает итог для памяти."""
         items = [{"name": self.make_ws_label(c.path), "old": c.old, "new": c.new, "created": c.created,
+                  "deleted": c.deleted,
                   "notes": [f"Затрагивает {z}: проверь внимательно." for z in c.needs_confirm]
                   + self.analysis_notes(analysis_report, self.make_ws_label(c.path))
                   + self.review_notes(report, self.make_ws_label(c.path))} for c in changes]
@@ -1496,6 +1498,8 @@ class MainWindow(QMainWindow):
     def write_one(self, ch) -> tuple[str, str] | None:
         """Применяет одно изменение. При неудаче возвращает причину (по-русски, по-английски), иначе None."""
         doc = next((d for d in self.docs if d.path and Path(os.path.realpath(d.path)) == ch.path), None)
+        if ch.deleted:
+            return self.delete_one(ch, doc)
         if doc is not None:
             if doc.text() != ch.old:
                 return "изменился в редакторе, пока работал агент", "changed in the editor while the agent worked"
@@ -1517,6 +1521,22 @@ class MainWindow(QMainWindow):
                 return (("изменился на диске, пока работал агент", "changed on disk while the agent worked")
                         if ch.old is not None else ("такой файл уже появился", "such a file appeared meanwhile"))
             write_change(ch)
+        except (OSError, UnicodeDecodeError) as e:
+            return str(e), str(e)
+        return None
+
+    def delete_one(self, ch, doc) -> tuple[str, str] | None:
+        """Удаление файла по предложению ИИ: только если он не менялся с тех пор, как его прочитал агент."""
+        if doc is not None and (doc.text() != ch.old or doc.modified):
+            return "есть несохранённые изменения во вкладке", "has unsaved changes in the editor"
+        try:
+            if not ch.path.is_file() or ch.path.read_text(encoding="utf-8") != ch.old:
+                return "изменился на диске, пока работал агент", "changed on disk while the agent worked"
+            if doc is not None:
+                doc.editor.document().setModified(False)
+                self.close_tab(self.tabs.indexOf(doc.editor))
+            ch.path.unlink()
+            sidecar(ch.path).unlink(missing_ok=True)
         except (OSError, UnicodeDecodeError) as e:
             return str(e), str(e)
         return None

@@ -211,7 +211,7 @@ class AnalysisReport:
 def _rels(ws: Workspace, analyzers: list[Analyzer]) -> tuple[list, list[str], list[str]]:
     """(изменения, пути для анализа, из них изменённые, а не новые)."""
     suffixes = tuple(sfx for an in analyzers for sfx in an.suffixes)
-    changes = [c for c in ws.changes() if c.path.name.endswith(suffixes)]
+    changes = [c for c in ws.changes() if c.path.name.endswith(suffixes) and not c.deleted]
     rels = [ws.rel(c.path) for c in changes]
     return changes, rels, [ws.rel(c.path) for c in changes if not c.created]
 

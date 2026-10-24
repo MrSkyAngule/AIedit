@@ -78,7 +78,8 @@ class ReviewDialog(QDialog):
         self.resize(900, 580)
         self.files = QListWidget()
         for it in items:
-            row = QListWidgetItem(it["name"] + ("  (новый)" if it.get("created") else ""))
+            row = QListWidgetItem(it["name"] + ("  (удаление)" if it.get("deleted") else
+                                               "  (новый)" if it.get("created") else ""))
             row.setFlags(row.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             row.setCheckState(Qt.CheckState.Checked)
             self.files.addItem(row)

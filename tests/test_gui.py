@@ -1606,6 +1606,38 @@ class ZonePersistenceTest(GuiCase):
         self.assertNotEqual(side.stat().st_mtime_ns, 1)
 
 
+class DeleteGuiTest(GuiCase):
+    def agent(self, replies):
+        w = self.window("b.py")
+        prov = Script(replies)
+        w.providers = {"cheap": prov, "strong": prov}
+        self.reviewed = []
+        w.review_changes = lambda items: (self.reviewed.append(items), [True] * len(items))[1]
+        return w, prov
+
+    def test_delete_and_rename_after_review(self):
+        w, _ = self.agent([call("delete_file", path="b.py") + "\n" + call("rename_file", path="pkg/util.py", new_path="lib/u.py"),
+                           "Готово."])
+        self.assertIn("b.py", [d.name for d in w.docs])
+        w.ask_ai("убери лишнее")
+        self.wait(w)
+        items = {it["name"]: it for it in self.reviewed[0]}
+        self.assertTrue(items["b.py"]["deleted"])
+        self.assertTrue(items["lib/u.py"]["created"])
+        self.assertFalse((self.root / "b.py").exists())
+        self.assertFalse((self.root / "pkg" / "util.py").exists())
+        self.assertEqual((self.root / "lib" / "u.py").read_text(), "def u():\n    return 'TOKEN_VALUE'\n")
+        self.assertNotIn("b.py", [d.name for d in w.docs])  # вкладка удалённого файла закрыта
+
+    def test_unsaved_tab_is_not_deleted(self):
+        w, _ = self.agent([call("delete_file", path="b.py"), "Готово."])
+        w.ask_ai("удали")
+        w.editor.insertPlainText("# моё\n")  # пока агент работал, человек правил файл
+        self.wait(w)
+        self.assertTrue((self.root / "b.py").exists())
+        self.assertIn("не применено: b.py", w.chat.history.toPlainText())
+
+
 class TerminalGuiTest(GuiCase):
     def setUp(self):
         super().setUp()

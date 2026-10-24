@@ -44,6 +44,8 @@ TOOLS: dict[str, dict] = {
     "search": {"query": str, "path": str, "case": bool},
     "edit_file": {"path": str, "old_text": str, "new_text": str},
     "create_file": {"path": str, "content": str},
+    "delete_file": {"path": str},
+    "rename_file": {"path": str, "new_path": str},
     "ask_user": {"question": str},  # не инструмент рабочей области: отвечает человек
     "run_command": {"command": str},  # выполняет редактор, в песочнице (sandbox.Terminal)
 }
@@ -122,7 +124,8 @@ def execute(ws: Workspace, call: Call) -> str:
     if call.error:
         return f"ERROR: {call.error}"
     required = {"read_file": ["path"], "search": ["query"], "edit_file": ["path", "old_text", "new_text"],
-                "create_file": ["path", "content"]}.get(call.name, [])
+                "create_file": ["path", "content"],
+                "delete_file": ["path"], "rename_file": ["path", "new_path"]}.get(call.name, [])
     missing = [r for r in required if r not in call.args]
     if missing:
         return f"ERROR: missing arguments: {', '.join(missing)}"
@@ -146,6 +149,10 @@ def describe_call(call: Call) -> str:
         return f"предлагаю правку в {a.get('path', '?')}"
     if call.name == "create_file":
         return f"предлагаю новый файл {a.get('path', '?')}"
+    if call.name == "delete_file":
+        return f"предлагаю удалить {a.get('path', '?')}"
+    if call.name == "rename_file":
+        return f"предлагаю перенести {a.get('path', '?')} → {a.get('new_path', '?')}"
     if call.name == "ask_user":
         return "задаю вопрос"
     if call.name == "run_command":

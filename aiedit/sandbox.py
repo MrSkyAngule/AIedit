@@ -142,7 +142,8 @@ def build_copy(ws: Workspace, dest: Path) -> list[str]:
         for name in sorted(filenames):
             src = here / name
             real = Path(os.path.realpath(src))
-            if not real.is_relative_to(ws.root) or not ws.visible(real) or policy.is_private_name(name):
+            if (not real.is_relative_to(ws.root) or not ws.visible(real) or policy.is_private_name(name)
+                    or ws.pending_delete(real)):
                 continue
             files += 1
             size += real.stat().st_size
@@ -258,7 +259,7 @@ class Terminal:
                  runner=None, timeout: float = TIMEOUT):
         self.ws, self.approve, self.show, self.runner, self.timeout = ws, approve, show, runner, timeout
         self.tmp: tempfile.TemporaryDirectory | None = None
-        self.synced: dict[Path, str] = {}
+        self.synced: dict[Path, str | None] = {}  # что записано в копию; None - удалён
         self.skipped: list[str] = []
         self.runs = 0
 
@@ -271,11 +272,15 @@ class Terminal:
             self.tmp = tempfile.TemporaryDirectory(prefix="aiedit-sandbox-")
             self.skipped = build_copy(self.ws, self.work)
         for path, st in self.ws.states.items():  # правки агента - в копию
+            target = self.work / path.relative_to(self.ws.root)
+            if st.deleted:
+                target.unlink(missing_ok=True)
+                self.synced[path] = None
+                continue
             if st.base is not None and st.text == st.base and path not in self.synced:
                 continue  # не менялся (если правку откатили, копию надо вернуть - тогда он в synced)
             text = sandbox_text(self.ws, st)
             if self.synced.get(path) != text:
-                target = self.work / path.relative_to(self.ws.root)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(text, encoding="utf-8")
                 self.synced[path] = text

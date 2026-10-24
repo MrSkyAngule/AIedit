@@ -56,6 +56,13 @@ you see it. Nothing is written to disk without your approval.
 **Secrets.** Lines that look like keys, tokens or private keys are hidden automatically.
 Output of tests and analyzers is scrubbed before it goes back to a model.
 
+**Outbound filter.** The last check before anything leaves the machine. Every request to every
+model (programmers, conductor, reviewer, translator) passes through it, including chat text,
+history and zone notes. It looks for secrets, words from your own list (client names, internal
+hosts) and lines of closed code you pasted into the chat, and asks: mask, send as is, or cancel.
+Masked values become `<<masked-N>>` labels and are restored in the model's reply, so edits around
+them still apply to the real text.
+
 **Audit.** Every request is logged locally: which files, how many lines were hidden,
 how many characters left the machine (the content itself is not logged).
 
@@ -96,7 +103,8 @@ The suite runs on both PyQt6 and PySide6 and uses fake providers and local HTTP 
 
 ## Limits (what this does not protect)
 
-- Text you type in the chat is sent as is. Do not paste secrets there.
+- The outbound filter recognizes only what it can match: secret patterns, your word list and
+  closed lines pasted verbatim. A secret retold in your own words goes out.
 - Names leak meaning: an `interface` signature like `calc_discount_for_client_x()` tells
   a lot. Zone notes are sent to the model too.
 - Everything that is not closed is sent to the provider you chose; what they do with it

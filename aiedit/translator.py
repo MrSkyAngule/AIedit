@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from . import secrets_scan
+from .outbound import SendCancelled
 
 MODEL = "gpt-4o-mini"
 URL = "https://api.openai.com/v1/chat/completions"
@@ -158,6 +159,8 @@ class Translator:
                     self.log(direction, len(piece))
                 parts.append(reply.strip())
             result = unmask("\n\n".join(parts), saved)
+        except SendCancelled:  # человек отменил отправку: идти дальше с оригиналом нельзя
+            raise
         except Exception as e:  # сеть, ключ, лимиты, формат ответа
             return Translation(text, False, f"переводчик недоступен: {type(e).__name__}: {e}", sent)
         if result is None or not result.strip() or len(result) > 4 * len(text) + 200:

@@ -7,8 +7,8 @@ from .searchdialog import SearchDialog
 from .qt import (BINDING, QAction, QApplication, QDockWidget, QFileDialog, QKeySequence,
                  QInputDialog, QMainWindow, QMessageBox, Qt, QTabWidget, QTextCursor, QThread, QTimer, QVBoxLayout, QWidget,
                  Signal)
-from . import (agent, analysis, checks, journal, conductor, flows, prompts, dialogs, guard, orchestrator, policy, related, secrets_scan, sendlog,
-               settings)
+from . import (agent, analysis, checks, journal, conductor, flows, prompts, dialogs, guard, orchestrator, outbound, policy, related,
+               secrets_scan, sendlog, settings)
 from . import chatstore
 from .chat import ChatPanel
 from .document import Doc
@@ -74,8 +74,14 @@ class AgentWorker(QThread):
 
 
 class MainWindow(QMainWindow):
+    outboundAsk = Signal(object)  # вопрос фильтра исходящего из рабочего потока в окно
+
     def __init__(self):
         super().__init__()
+        user = settings.get_user()
+        self.gate = outbound.Gate(user.get("outbound_words", []), self.decide_outbound, self.log_filter,
+                                  bool(user.get("outbound", True)))
+        self.outboundAsk.connect(self.answer_outbound, Qt.ConnectionType.BlockingQueuedConnection)
         self.translator: Translator | None = None
         self.setup_ai(self.current_setup())
         self.conductor_on = bool(settings.get_user().get("conductor", True))
@@ -196,6 +202,11 @@ class MainWindow(QMainWindow):
         self.action(ai, "Сбросить контекст", self.clear_context)
         ai.addSeparator()
         self.action(ai, "Подключения ИИ...", self.open_connections, "Ctrl+Shift+A")
+        ai.addSeparator()
+        self.act_outbound = self.action(ai, "Фильтр исходящего: проверять всё перед отправкой", self.toggle_outbound)
+        self.act_outbound.setCheckable(True)
+        self.act_outbound.setChecked(self.gate.enabled)
+        self.action(ai, "Слова для фильтра исходящего...", self.edit_outbound_words)
         ai.addSeparator()
         self.act_translate = self.action(ai, "Переводить задачи и ответы", self.toggle_translate)
         self.act_translate.setCheckable(True)
@@ -890,6 +901,7 @@ class MainWindow(QMainWindow):
         if self.worker:
             return
         self.history.clear()
+        self.gate.reset()  # новый чат - решения фильтра спрашиваются заново
         self.chat.reset()
         self.update_chat_title()
         self.say("новый чат: память очищена")
@@ -913,8 +925,9 @@ class MainWindow(QMainWindow):
         self.base_text = self.req_doc.text()
         self.base_regions = list(self.req_doc.marks.items)
         self.sent_task, self.sent_source = task, self.path
+        self.watch_task(task)
         self.run_worker(flows.run_ask, self.active_translator(), self.base_text, task, self.base_regions,
-                        self.providers, self.path, list(self.history), self.context_inputs(),
+                        self.guarded_providers(), self.path, list(self.history), self.context_inputs(),
                         self.tree.root, on_done=self.on_result)
 
     # --- подключения ИИ ---
@@ -973,9 +986,93 @@ class MainWindow(QMainWindow):
             self.say("подключений нет: работают ключи из окружения или демо-режим")
         return True
 
+    # --- фильтр исходящего ---
+    def decide_outbound(self, findings: list[outbound.Finding], model: str) -> str:
+        """Вызывается из потока запроса: окно можно показать только из главного, туда и передаём."""
+        if QThread.currentThread() == self.thread():
+            return self.ask_outbound(findings, model)
+        box = {"findings": findings, "model": model, "answer": "cancel"}
+        self.outboundAsk.emit(box)  # ждёт, пока человек ответит
+        return box["answer"]
+
+    def answer_outbound(self, box: dict):
+        box["answer"] = self.ask_outbound(box["findings"], box["model"])
+
+    def ask_outbound(self, findings: list[outbound.Finding], model: str) -> str:
+        """mask, send или cancel."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Фильтр исходящего")
+        box.setText(f"В запросе к {model} найдено то, что лучше не отправлять: {len(findings)}.")
+        lines = [f"• {f.kind}: {f.preview()}" for f in findings[:10]]
+        if len(findings) > 10:
+            lines.append(f"... и ещё {len(findings) - 10}")
+        box.setInformativeText("\n".join(lines) + "\n\n«Скрыть» заменит это метками; в ответе модели "
+                               "метки вернутся обратно. Решение запомнится до нового чата.")
+        hide = box.addButton("Скрыть и отправить", QMessageBox.ButtonRole.AcceptRole)
+        send = box.addButton("Отправить как есть", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(hide)
+        box.exec()
+        return {hide: "mask", send: "send"}.get(box.clickedButton(), "cancel")
+
+    def log_filter(self, entry: dict):
+        """В журнал отправок: что нашёл фильтр и что решил человек. Самих значений там нет."""
+        sendlog.record(None, entry, getattr(self.tree, "root", None))
+
+    def toggle_outbound(self):
+        self.gate.enabled = self.act_outbound.isChecked()
+        settings.set_user(outbound=self.gate.enabled)
+        self.say("фильтр исходящего включён: каждый запрос проверяется на секреты, слова из списка и закрытый код"
+                 if self.gate.enabled else
+                 "фильтр исходящего выключен: текст задач и чата уходит модели без проверки")
+
+    def edit_outbound_words(self):
+        text, ok = QInputDialog.getMultiLineText(
+            self, "Слова для фильтра исходящего",
+            "По одному на строке: имена клиентов, название компании, внутренние адреса серверов.\n"
+            "Найденное в запросе фильтр предложит скрыть. Регистр не важен.\n"
+            "Список хранится в настройках пользователя, не в проекте.",
+            "\n".join(self.gate.words))
+        if not ok:
+            return
+        words = [w.strip() for w in text.split("\n") if w.strip()]
+        self.gate.set_words(words)
+        if not settings.set_user(outbound_words=self.gate.words):
+            self.say("не удалось сохранить список слов (нет доступа к папке настроек)")
+        short = len(words) - len(self.gate.words)
+        self.say(f"слов в фильтре: {len(self.gate.words)}"
+                 + (f"; пропущено слишком коротких: {short}" if short > 0 else ""))
+
+    def closed_code_lines(self) -> set[str]:
+        """Строки закрытого кода в открытых файлах, кроме сигнатур interface: их модель и так видит."""
+        out = set()
+        for d in self.docs:
+            lines = d.text().split("\n")
+            for r in d.marks.items:
+                if r.level == "hidden":
+                    out.update(lines[r.start:r.end + 1])
+                elif r.level == "interface":
+                    out.update(l for l in lines[r.start:r.end + 1]
+                               if not l.lstrip().startswith(("def ", "async def ", "class ", "@")))
+        return out
+
+    def watch_task(self, task: str):
+        """Если человек вставил в задачу строки закрытого кода, фильтр спросит про них перед отправкой."""
+        self.gate.watch_closed(task, self.closed_code_lines())
+
+    def guarded_providers(self) -> dict:
+        return {k: self.gate.wrap(p) for k, p in self.providers.items()}
+
     # --- переводчик ---
     def active_translator(self) -> Translator | None:
-        return self.translator if self.translate_on else None
+        """Переводчик за фильтром исходящего: переводу уходит проза задач и ответов, она тоже проверяется."""
+        t = self.translator if self.translate_on else None
+        if t is None:
+            return None
+        guarded = Translator(self.gate.wrap_transport(t.transport, t.model), t.log, t.model)
+        guarded.cache = t.cache
+        return guarded
 
     def log_translation(self, direction: str, chars: int):
         """Каждое обращение к переводчику - тоже отправка стороннему сервису, она идёт в журнал."""
@@ -1158,9 +1255,10 @@ class MainWindow(QMainWindow):
         self.explain_btn.setEnabled(False)
         self.chat.set_busy(True, "Дирижёр планирует..." if self.conductor_on else "Агент работает...", can_stop=True)
         self.agent_provider = provider
-        self.worker = AgentWorker(task, self.make_workspace(), provider, list(self.history), self.path,
-                                  self.active_translator(), self.roster, self.conductor_on, self.review_active(),
-                                  self.analyze_on)
+        self.watch_task(task)
+        self.worker = AgentWorker(task, self.make_workspace(), self.gate.wrap(provider), list(self.history), self.path,
+                                  self.active_translator(), self.gate.wrap_roster(self.roster), self.conductor_on,
+                                  self.review_active(), self.analyze_on)
         self.worker.progress.connect(self.say)
         self.worker.done.connect(self.on_agent_done)
         self.worker.failed.connect(self.on_fail)
@@ -1290,7 +1388,7 @@ class MainWindow(QMainWindow):
         self.chat.add_user("Объясни зелёные зоны")
         self.sent_task, self.sent_source = "Объясни зелёные зоны", self.path
         self.run_worker(flows.run_explain, self.active_translator(), self.editor.toPlainText(),
-                        list(self.marks.items), self.providers, self.path, list(self.history),
+                        list(self.marks.items), self.guarded_providers(), self.path, list(self.history),
                         self.context_inputs(), self.tree.root, on_done=self.on_explain)
 
     def finish(self):
@@ -1299,7 +1397,12 @@ class MainWindow(QMainWindow):
         self.refresh_access()
 
     def on_fail(self, err: str):
-        self.say(f"ошибка: {err}")
+        if err.startswith(outbound.SendCancelled.__name__):
+            self.say("запрос остановлен в фильтре исходящего: найденное модели не ушло")
+            if not self.chat.input.toPlainText().strip():
+                self.chat.input.setPlainText(self.sent_task)  # не теряем набранное
+        else:
+            self.say(f"ошибка: {err}")
         self.finish()
 
     def on_explain(self, res: orchestrator.Explanation):

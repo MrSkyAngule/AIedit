@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import agent, analysis, orchestrator, policy, prompts, review as security
+from .outbound import SendCancelled
 from .providers import Provider
 from .roster import Roster, Worker
 from .workspace import Workspace
@@ -258,7 +259,7 @@ def run(task: str, ws: Workspace, roster: Roster, conductor: Provider, history: 
             r = agent.run(task_prompt(task, plan, t, index, results), ws, worker.provider, None, open_file,
                           on_progress=lambda note, tid=t.id: say(f"{tid}: {note}"), should_stop=should_stop,
                           english_reply=english_reply, max_steps=min(agent.MAX_STEPS, left))
-        except policy.AccessDenied:
+        except (policy.AccessDenied, SendCancelled):
             raise
         except Exception as e:  # сбой одного исполнителя не должен ронять весь план
             results.append(TaskResult(t, "failed", f"{type(e).__name__}: {e}"))

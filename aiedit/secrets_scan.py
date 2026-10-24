@@ -61,6 +61,34 @@ def scan(text: str) -> list[Finding]:
     return [Finding(i, k) for i, k in sorted(found.items())]
 
 
+def spans(text: str) -> list[tuple[int, int, str]]:
+    """Где именно в тексте секреты: (начало, конец, вид) в символах. В отличие от scan отмечает
+    само значение, а не строку целиком: из «вот ключ sk-..., почему не работает?» уйдёт только ключ."""
+    out: list[tuple[int, int, str]] = []
+    pos, key_start = 0, None
+    for line in text.split("\n"):
+        end = pos + len(line)
+        if key_start is not None or _PRIVATE_BEGIN.search(line):
+            if key_start is None:
+                key_start = pos + _PRIVATE_BEGIN.search(line).start()
+            m = _PRIVATE_END.search(line)
+            if m:
+                out.append((key_start, pos + m.end(), "приватный ключ"))
+                key_start = None
+        else:
+            for kind, rx in _TOKENS.items():
+                out += [(pos + m.start(), pos + m.end(), kind) for m in rx.finditer(line)]
+            for rx in (_QUOTED, _DOTENV):  # как в scan: второй шаблон, только если первый не нашёл
+                hits = [m for m in rx.finditer(line) if not _PLACEHOLDER_VALUE.match(m[1])]
+                out += [(pos + m.start(1), pos + m.end(1), "пароль или токен в значении") for m in hits]
+                if hits:
+                    break
+        pos = end + 1
+    if key_start is not None:  # ключ без конца: скрываем до конца текста
+        out.append((key_start, len(text), "приватный ключ"))
+    return sorted(set(out))
+
+
 def uncovered(findings: list[Finding], regions: list[Region], n_lines: int) -> list[Finding]:
     """Находки, которые ещё видны модели (не закрыты hidden или interface)."""
     lr = line_regions(n_lines, regions)

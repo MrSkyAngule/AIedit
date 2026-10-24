@@ -78,8 +78,8 @@ class GuiCase(unittest.TestCase):
         for _ in range(3):
             app.processEvents()
             for t in (w.worker, w.check_worker):
-                if t:
-                    t.wait()
+                while t and not t.wait(10):  # окно должно жить: поток может ждать ответа из окна
+                    app.processEvents()
             app.processEvents()
 
     @staticmethod
@@ -1591,6 +1591,120 @@ class ZonePersistenceTest(GuiCase):
         m.add("readonly", 1, 1)
         m.save(f, "y = 2\n")
         self.assertNotEqual(side.stat().st_mtime_ns, 1)
+
+
+class OutboundGuiTest(GuiCase):
+    KEY = "sk-ant-api03-AbCdEf0123456789xyz"
+
+    def agent(self, replies, answer="mask"):
+        w = self.window()
+        prov = Script(replies)
+        w.providers = {"cheap": prov, "strong": prov}
+        w.review_changes = lambda items: [True] * len(items)
+        self.asked = []
+        w.ask_outbound = lambda findings, model: (self.asked.append([f.kind for f in findings]), answer)[1]
+        return w, prov
+
+    def test_key_in_chat_is_masked_in_agent_mode_and_asked_once(self):
+        w, prov = self.agent(["первый", "второй"])
+        w.ask_ai(f"почему ключ {self.KEY} не работает?")
+        self.wait(w)
+        self.assertNotIn(self.KEY, prov.everything())
+        self.assertIn("почему ключ <<masked-1>> не работает?", prov.everything())
+        self.assertEqual(w.history[0].text, f"почему ключ {self.KEY} не работает?")  # у себя храним как есть
+        w.ask_ai("а теперь?")  # история с ключом уходит снова - решение уже есть, не спрашиваем
+        self.wait(w)
+        self.assertEqual(self.asked, [["ключ API (sk-...)"]])
+        self.assertNotIn(self.KEY, prov.everything())
+        self.assertTrue(any(e.get("mode") == "filter" for e in sendlog.read(self.root)))
+        self.assertNotIn(self.KEY, (self.root / sendlog.LOG_NAME).read_text())
+
+    def test_cancel_sends_nothing_and_keeps_the_task(self):
+        w, prov = self.agent(["не должен ответить"], answer="cancel")
+        w.ask_ai(f"ключ {self.KEY}")
+        self.wait(w)
+        self.assertEqual(prov.seen, [])
+        self.assertIn("остановлен в фильтре исходящего", w.chat.history.toPlainText())
+        self.assertEqual(w.chat.input.toPlainText(), f"ключ {self.KEY}")
+        self.assertIsNone(w.worker)
+
+    def test_single_file_mode_is_filtered_too(self):
+        w = self.window()
+        w.tree.root = None  # без папки: запрос по одному файлу
+        prov = Script(["Готово.\n```\ndef f():\n    return 1\n\ndef g():\n    return 2\n```"])
+        w.providers = {"cheap": prov, "strong": prov}
+        w.ask_outbound = lambda findings, model: "mask"
+        w.ask_ai(f"вот ключ {self.KEY}")
+        self.wait(w)
+        self.assertTrue(prov.seen)
+        self.assertNotIn(self.KEY, prov.everything())
+
+    def test_words_from_settings_and_menu(self):
+        w, prov = self.agent(["ок"])
+        w.edit_outbound_words = w.edit_outbound_words  # пункт меню существует
+        w.gate.set_words(["Газпром"])
+        settings.set_user(outbound_words=w.gate.words)
+        w.ask_ai("сделай отчёт для газпром")
+        self.wait(w)
+        self.assertNotIn("газпром", prov.everything().lower())
+        self.assertEqual(self.asked, [["слово из списка"]])
+        self.assertEqual(MainWindow().gate.words, ["Газпром"])  # список пережил перезапуск
+
+    def test_pasted_hidden_code_is_caught(self):
+        w, prov = self.agent(["ок"])
+        w.marks.add("hidden", 0, 1)  # def f(): return 1
+        w.ask_ai("почему здесь\n    return 1\nа не 2?")  # короткая строка - не ловим
+        self.wait(w)
+        self.assertEqual(self.asked, [])
+        (self.root / "c.py").write_text("def calc():\n    return amount * 0.07  # secret fee\n")
+        d = w.load(self.root / "c.py")
+        d.marks.add("hidden", 1, 1)
+        w.ask_ai("поправь:\n    return amount * 0.07  # secret fee")
+        self.wait(w)
+        self.assertEqual(self.asked, [["строка закрытого кода"]])
+        self.assertNotIn("0.07", "\n".join(m["content"] for m in prov.seen[-1]))
+
+    def test_interface_signature_is_not_closed_code(self):
+        w, _ = self.agent([])
+        (self.root / "c.py").write_text("def calculate_fee(amount, rate):\n    return amount * rate * 0.07\n")
+        d = w.load(self.root / "c.py")
+        d.marks.add("interface", 0, 1)
+        lines = w.closed_code_lines()
+        self.assertIn("    return amount * rate * 0.07", lines)
+        self.assertNotIn("def calculate_fee(amount, rate):", lines)
+
+    def test_translator_goes_through_the_filter(self):
+        from tests.test_translator import Fake
+        w, prov = self.agent(["Done"])
+        fake = Fake()
+        seen = []
+        w.translator = Translator(lambda p: (seen.append(p["messages"][-1]["content"]), fake(p))[1])
+        w.translate_on = True
+        w.gate.set_words(["Газпром"])
+        w.ask_ai("сделай отчёт для Газпром")
+        self.wait(w)
+        self.assertTrue(seen)
+        self.assertNotIn("Газпром", "\n".join(seen))
+        self.assertEqual(len(self.asked), 1)  # переводчик и исполнитель - одно решение
+
+    def test_toggle_off_sends_as_is(self):
+        w, prov = self.agent(["ок"])
+        w.act_outbound.setChecked(False)
+        w.toggle_outbound()
+        w.ask_ai(f"ключ {self.KEY}")
+        self.wait(w)
+        self.assertEqual(self.asked, [])
+        self.assertIn(self.KEY, prov.everything())
+        self.assertFalse(settings.get_user()["outbound"])
+
+    def test_new_chat_asks_again(self):
+        w, _ = self.agent(["1", "2"])
+        w.ask_ai(f"ключ {self.KEY}")
+        self.wait(w)
+        w.clear_chat()
+        w.ask_ai(f"ключ {self.KEY}")
+        self.wait(w)
+        self.assertEqual(len(self.asked), 2)
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ from .qt import (BINDING, QAction, QApplication, QDockWidget, QFileDialog, QKeyS
                  QInputDialog, QMainWindow, QMessageBox, Qt, QTabWidget, QTextCursor, QThread, QTimer, QVBoxLayout, QWidget,
                  Signal)
 from . import (agent, analysis, checkpoints, checks, journal, conductor, flows, prompts, dialogs, guard, orchestrator, outbound, policy, related,
-               sandbox, secrets_scan, sendlog, settings)
+               sandbox, secrets_scan, sendlog, settings, web)
 from . import chatstore
 from .chat import ChatPanel
 from .document import Doc
@@ -51,7 +51,7 @@ class AgentWorker(QThread):
     failed = Signal(str)
 
     def __init__(self, task, ws, provider, history, open_file, translator=None, roster=None,
-                 conduct=False, review_on=False, analyze_on=False, approve_command=None):
+                 conduct=False, review_on=False, analyze_on=False, approve_command=None, reader=None):
         super().__init__()
         self.args = (task, ws, provider, history, open_file)
         self.translator = translator
@@ -65,6 +65,7 @@ class AgentWorker(QThread):
         # терминал в песочнице, если человек его включил: approve_command спрашивает про каждую команду
         self.terminal = (sandbox.Terminal(ws, approve_command, self.command_done.emit)
                          if approve_command is not None else None)
+        self.reader = reader  # web.Web, если человек разрешил ИИ читать страницы документации
 
     def ask(self, question: str) -> str | None:
         """Вопрос модели человеку: показываем в окне и ждём ответа. None - остановили, не дождавшись."""
@@ -83,12 +84,12 @@ class AgentWorker(QThread):
                 result = flows.run_conductor(task, ws, self.roster, provider, history, open_file, self.translator,
                                              on_progress=self.progress.emit, should_stop=lambda: self.cancel,
                                              review_on=self.review_on, analyze_on=self.analyze_on, ask=self.ask,
-                                             terminal=self.terminal)
+                                             terminal=self.terminal, web=self.reader)
             else:
                 result = flows.run_agent(task, ws, provider, history, open_file, self.translator,
                                          on_progress=self.progress.emit, should_stop=lambda: self.cancel,
                                          roster=self.roster, review_on=self.review_on, analyze_on=self.analyze_on,
-                                         ask=self.ask, terminal=self.terminal)
+                                         ask=self.ask, terminal=self.terminal, web=self.reader)
             self.done.emit(result)
         except Exception as e:  # доступ закрыли по ходу работы, сеть, формат ответа
             self.failed.emit(f"{type(e).__name__}: {e}")
@@ -100,6 +101,7 @@ class AgentWorker(QThread):
 class MainWindow(QMainWindow):
     outboundAsk = Signal(object)  # вопрос фильтра исходящего из рабочего потока в окно
     commandAsk = Signal(object)   # вопрос «выполнить команду?» из рабочего потока в окно
+    webAsk = Signal(object)       # вопрос «открыть страницу?» из рабочего потока в окно
 
     def __init__(self):
         super().__init__()
@@ -109,6 +111,9 @@ class MainWindow(QMainWindow):
         self.outboundAsk.connect(self.answer_outbound, Qt.ConnectionType.BlockingQueuedConnection)
         self.commandAsk.connect(self.answer_command, Qt.ConnectionType.BlockingQueuedConnection)
         self.terminal_on = bool(user.get("terminal", True))
+        self.webAsk.connect(self.answer_web, Qt.ConnectionType.BlockingQueuedConnection)
+        self.web_on = bool(user.get("web", True))
+        self.web_sites: list[str] = list(user.get("web_sites", web.DEFAULT_SITES))
         self.translator: Translator | None = None
         self.setup_ai(self.current_setup())
         self.conductor_on = bool(settings.get_user().get("conductor", True))
@@ -240,6 +245,10 @@ class MainWindow(QMainWindow):
         self.act_terminal.setCheckable(True)
         self.refresh_terminal_action()
         self.action(ai, "Разрешённые без вопроса команды...", self.edit_allowed_commands)
+        self.act_web = self.action(ai, "Интернет для ИИ: читать страницы документации", self.toggle_web)
+        self.act_web.setCheckable(True)
+        self.act_web.setChecked(self.web_on)
+        self.action(ai, "Сайты, которые ИИ читает без вопроса...", self.edit_web_sites)
         ai.addSeparator()
         self.act_translate = self.action(ai, "Переводить задачи и ответы", self.toggle_translate)
         self.act_translate.setCheckable(True)
@@ -1160,6 +1169,67 @@ class MainWindow(QMainWindow):
         self.chat.add("check", checks.tail(res.output.strip()) or "(вывода нет)",
                       f"песочница · {res.status()} · {res.seconds:.1f} с · {res.command}")
 
+    # --- интернет (страницы документации) ---
+    def make_reader(self) -> "web.Web | None":
+        if not self.web_on:
+            return None
+        return web.Web(self.web_sites, self.decide_web, lambda url: [f.kind for f in self.gate.find(url)],
+                       self.log_filter)
+
+    def toggle_web(self):
+        self.web_on = self.act_web.isChecked()
+        settings.set_user(web=self.web_on)
+        self.say("ИИ может читать страницы документации: сайты из списка - без вопроса, другие - с твоего согласия"
+                 if self.web_on else "интернет для ИИ выключен")
+
+    def edit_web_sites(self):
+        text, ok = QInputDialog.getMultiLineText(
+            self, "Сайты для ИИ",
+            "ИИ открывает эти сайты без вопроса (и их поддомены), остальные - только с твоего согласия.\n"
+            "По одному на строке, например docs.python.org.", "\n".join(self.web_sites))
+        if ok:
+            self.web_sites = sorted({s.strip().lower() for s in text.split("\n") if s.strip()})
+            settings.set_user(web_sites=self.web_sites)
+            self.say(f"сайтов без вопроса: {len(self.web_sites)}")
+
+    def decide_web(self, url: str, found: list[str]) -> str:
+        if QThread.currentThread() == self.thread():
+            return self.approve_web(url, found)
+        box = {"url": url, "found": found, "answer": "deny"}
+        self.webAsk.emit(box)
+        return box["answer"]
+
+    def answer_web(self, box: dict):
+        box["answer"] = self.approve_web(box["url"], box["found"])
+
+    def approve_web(self, url: str, found: list[str]) -> str:
+        answer = self.ask_web(url, found)
+        host = web.host_of(url)
+        if answer == "always" and not found and host not in self.web_sites:
+            self.web_sites.append(host)
+            settings.set_user(web_sites=self.web_sites)
+            self.say(f"сайт {host} теперь открывается без вопроса")
+        return answer
+
+    def ask_web(self, url: str, found: list[str]) -> str:
+        """open, always или deny."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning if found else QMessageBox.Icon.Question)
+        box.setWindowTitle("ИИ хочет открыть страницу")
+        box.setText(f"ИИ хочет прочитать:\n\n{url}")
+        info = "Сайта нет в списке. Сайт узнает только адрес страницы, больше ничего."
+        if found:
+            info = ("В адресе фильтр исходящего нашёл: " + ", ".join(sorted(set(found)))
+                    + ".\nЕсли открыть, это уйдёт сайту.")
+        box.setInformativeText(info)
+        go = box.addButton("Открыть", QMessageBox.ButtonRole.AcceptRole)
+        always = None if found else box.addButton(f"Всегда разрешать {web.host_of(url)}", QMessageBox.ButtonRole.YesRole)
+        box.addButton("Отказать", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(go)
+        box.exec()
+        clicked = box.clickedButton()
+        return "open" if clicked is go else "always" if always is not None and clicked is always else "deny"
+
     def closed_code_lines(self) -> set[str]:
         """Строки закрытого кода в открытых файлах, кроме сигнатур interface: их модель и так видит."""
         out = set()
@@ -1375,7 +1445,7 @@ class MainWindow(QMainWindow):
         self.worker = AgentWorker(task, self.make_workspace(), self.gate.wrap(provider), list(self.history), self.path,
                                   self.active_translator(), self.gate.wrap_roster(self.roster), self.conductor_on,
                                   self.review_active(), self.analyze_on,
-                                  self.decide_command if self.terminal_active() else None)
+                                  self.decide_command if self.terminal_active() else None, self.make_reader())
         self.worker.progress.connect(self.say)
         self.worker.question.connect(self.on_question)
         self.worker.command_done.connect(self.show_command)

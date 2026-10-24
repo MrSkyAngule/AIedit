@@ -48,6 +48,7 @@ TOOLS: dict[str, dict] = {
     "rename_file": {"path": str, "new_path": str},
     "ask_user": {"question": str},  # не инструмент рабочей области: отвечает человек
     "run_command": {"command": str},  # выполняет редактор, в песочнице (sandbox.Terminal)
+    "fetch_url": {"url": str},  # открывает редактор, только сайты из списка или с одобрения (web.Web)
 }
 _SECTION_ARG = {"old": "old_text", "new": "new_text", "content": "content", "question": "question"}
 
@@ -157,15 +158,23 @@ def describe_call(call: Call) -> str:
         return "задаю вопрос"
     if call.name == "run_command":
         return f"запускаю в песочнице: {a.get('command', '?')[:120]}"
+    if call.name == "fetch_url":
+        return f"читаю страницу: {a.get('url', '?')[:120]}"
     return call.name
 
 
-def run_terminal(call: Call, terminal: Callable[[str], str] | None) -> str:
+# инструменты, которые выполняет не рабочая область, а помощник от редактора: имя -> (аргумент, ответ без помощника)
+HELPED = {
+    "run_command": ("command", "ERROR: no terminal here. Check your work by reading the code instead."),
+    "fetch_url": ("url", "ERROR: no web access here. Rely on what you know and say what you are unsure about."),
+}
+
+
+def run_helper(call: Call, helper: Callable[[str], str] | None) -> str:
     if call.error:
         return f"ERROR: {call.error}"
-    if terminal is None:
-        return "ERROR: no terminal here. Check your work by reading the code instead."
-    return terminal(call.args.get("command", ""))
+    arg, unavailable = HELPED[call.name]
+    return helper(call.args.get(arg, "")) if helper is not None else unavailable
 
 
 def ask_human(call: Call, ask: Callable[[str], str | None] | None, asked: int) -> tuple[str, bool]:
@@ -195,10 +204,11 @@ def run(task: str, ws: Workspace, provider: Provider, history: list | None = Non
         should_stop: Callable[[], bool] | None = None, english_reply: bool = False,
         max_steps: int = MAX_STEPS, system: str | None = None,
         ask: Callable[[str], str | None] | None = None,
-        terminal: Callable[[str], str] | None = None) -> AgentResult:
+        terminal: Callable[[str], str] | None = None, web: Callable[[str], str] | None = None) -> AgentResult:
     """Крутит цикл: запрос к модели, выполнение инструментов, ответ редактора, пока не будет итога.
     ask(вопрос) -> ответ человека или None; без ask модель не знает про ask_user и решает сама.
-    terminal(команда) -> вывод для модели (sandbox.Terminal); без него run_command нет."""
+    terminal(команда) -> вывод для модели (sandbox.Terminal); без него run_command нет.
+    web(адрес) -> текст страницы (web.Web); без него fetch_url нет. Проверяющему (read_only) они не даются."""
     say = on_progress or (lambda _: None)
     stop = should_stop or (lambda: False)
     first = first_message(task, ws, open_file)
@@ -206,7 +216,12 @@ def run(task: str, ws: Workspace, provider: Provider, history: list | None = Non
     result = AgentResult("", [])
     spent = len(first)
     asked = 0
-    system = prompts.agent_system(system or SYSTEM, ask is not None, terminal is not None and not ws.read_only)
+    if ws.read_only:
+        terminal = web = None
+    helpers = {"run_command": terminal, "fetch_url": web}
+    system = prompts.agent_system(system or SYSTEM, [addon for on, addon in (
+        (ask is not None, prompts.ASK_ADDON), (terminal is not None, prompts.TERMINAL_ADDON),
+        (web is not None, prompts.WEB_ADDON)) if on])
     for step in range(1, max_steps + 1):
         if stop():
             result.stopped = "остановлено пользователем"
@@ -229,8 +244,8 @@ def run(task: str, ws: Workspace, provider: Provider, history: list | None = Non
             if call.name == "ask_user":
                 out, used = ask_human(call, ask, asked)
                 asked += used
-            elif call.name == "run_command":
-                out = run_terminal(call, None if ws.read_only else terminal)
+            elif call.name in HELPED:
+                out = run_helper(call, helpers[call.name])
             else:
                 out = execute(ws, call)
             spent += len(out)

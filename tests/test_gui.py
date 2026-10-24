@@ -15,7 +15,7 @@ except ImportError:  # нет Qt - тесты окна пропускаем
     QApplication = None
 
 if QApplication is not None:
-    from aiedit import chatstore, policy, sendlog, settings
+    from aiedit import chatstore, policy, sendlog, settings, web
     from aiedit.marks import text_hash
     from aiedit.app import MainWindow
     from aiedit.providers import Provider
@@ -1703,6 +1703,61 @@ class RollbackGuiTest(GuiCase):
         w, _ = self.agent([])
         w.rollback()
         self.assertIn("откатывать нечего", w.chat.history.toPlainText())
+
+
+class WebGuiTest(GuiCase):
+    def agent(self, replies, answer="open"):
+        w = self.window()
+        prov = Script(replies)
+        w.providers = {"cheap": prov, "strong": prov}
+        self.asked = []
+        w.ask_web = lambda url, found: (self.asked.append((url, found)), answer)[1]
+        return w, prov
+
+    def reader(self, w):
+        r = w.make_reader()
+        r.fetcher = lambda url, sites, allow_http=False: (url, f"TEXT OF {url}")
+        return r
+
+    def test_listed_site_without_question_other_with_question(self):
+        w, _ = self.agent([])
+        r = self.reader(w)
+        self.assertIn("TEXT OF https://docs.python.org/3/", r("https://docs.python.org/3/"))
+        self.assertEqual(self.asked, [])
+        self.assertIn("TEXT OF https://example.org/a", r("https://example.org/a"))
+        self.assertEqual(self.asked, [("https://example.org/a", [])])
+        self.assertTrue(any(e.get("mode") == "web" for e in sendlog.read(self.root)))
+
+    def test_always_is_saved_in_user_settings(self):
+        w, _ = self.agent([], answer="always")
+        self.reader(w)("https://example.org/a")
+        self.assertIn("example.org", settings.get_user()["web_sites"])
+        self.assertIn("example.org", MainWindow().web_sites)
+
+    def test_url_with_filtered_word_asks(self):
+        w, _ = self.agent([], answer="deny")
+        w.gate.set_words(["Газпром"])
+        out = self.reader(w)("https://docs.python.org/search?q=газпром")
+        self.assertEqual(out, web.OUT_DECLINED)
+        self.assertEqual(self.asked[0][1], ["слово из списка"])
+
+    def test_agent_gets_page_through_worker_thread(self):
+        w, prov = self.agent([call("fetch_url", url="https://example.org/doc"), "ок"])
+        orig = w.make_reader
+        w.make_reader = lambda: (lambda r: (setattr(r, "fetcher", lambda url, sites, allow_http=False: (url, "DOC")), r)[1])(orig())
+        w.ask_ai("посмотри доку")
+        self.wait(w)
+        self.assertEqual(self.asked, [("https://example.org/doc", [])])
+        self.assertIn("DOC", prov.everything())
+
+    def test_toggle_off(self):
+        w, prov = self.agent(["ок"])
+        w.act_web.setChecked(False)
+        w.toggle_web()
+        self.assertIsNone(w.make_reader())
+        w.ask_ai("сделай")
+        self.wait(w)
+        self.assertNotIn("fetch_url", prov.systems[0])
 
 
 class TerminalGuiTest(GuiCase):

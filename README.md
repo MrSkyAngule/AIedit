@@ -58,14 +58,26 @@ you see it. Nothing is written to disk without your approval.
 | `edit_file`, `create_file`, `delete_file`, `rename_file` | propose changes | applied only after review; files with zones can't be deleted or moved |
 | `run_command` | run tests or the program | sandbox, your approval (below) |
 | `fetch_url` | read a documentation page | https only; sites outside your list need approval |
+| `web_search` | search the web (Brave Search API, your key) | the query passes the outbound filter |
 | `install_packages` | ask to `pip install` into `.venv` | your approval every time; PyPI names only; prebuilt wheels only, so no package code runs on install |
 | `ask_user` | ask you when the task is unclear | |
+| `update_notes` | keep a working plan for a long task | |
+
+**Project rules.** Put an `AGENTS.md` (or `AIEDIT.md`, `CLAUDE.md`) in the project root: stack, how
+to run tests, code style, what not to touch. The agent and the conductor get it with every task.
+It is read like any other file, so zones and secrets in it stay hidden. Rules are text for the
+model, not a lock: protection comes from zones and closed paths.
+
+**Long tasks.** When the conversation grows, the editor clears old tool results and long bodies of
+old edits, keeps the task and the last step, and adds a summary: which files are already changed
+and the agent's own plan. No extra model call is needed for this. After 40 steps the editor asks
+whether to continue and shows how many tokens were sent so far.
 
 **Rollback.** Before applying the agent's edits the editor saves how the files looked. Any applied
 run can be rolled back from the menu, including created and deleted files and the zones. Rollback
 points live in your user profile, not in the project or git.
 
-**Terminal in a sandbox (Linux).** The agent can run commands (`pytest`, the program itself) to
+**Terminal in a sandbox (Linux; macOS experimental).** The agent can run commands (`pytest`, the program itself) to
 check its work, but the editor runs them, not the model:
 
 - each command needs your approval (simple commands like `pytest` can be allowed once and for all);
@@ -73,6 +85,8 @@ check its work, but the editor runs them, not the model:
 - the copy holds only what the model may see: closed files are absent, `interface` functions keep
   their signatures but raise `NotImplementedError`, `hidden` code and secret lines are gone;
 - no network, no home directory, an empty environment (no API keys), a time limit;
+- Linux: bubblewrap. macOS: the built-in `sandbox-exec` with a deny-by-default profile; it is
+  covered by tests of the profile only, not run on a real Mac yet. Windows: run the editor in WSL;
 - whatever the command changes stays in the copy and is thrown away.
 
 So even a command that prints every file in base64 cannot leak closed code: it is not there.
@@ -140,7 +154,7 @@ The suite runs on both PyQt6 and PySide6 and uses fake providers and local HTTP 
   is governed by their terms.
 - `interface` works for Python only; other languages fall back to `hidden`.
 - Tests and analyzers the editor runs on its own (post-edit check, static analysis) are ordinary
-  local processes; only the agent's commands go through the sandbox. The sandbox is Linux-only.
+  local processes; only the agent's commands go through the sandbox. No sandbox on native Windows.
 - In the sandbox, code inside closed zones does not run, and lines that look like secrets are
   removed even if the secret is fake. Code that depends on them fails there.
 - Web pages are untrusted input. The model is told not to follow instructions from them, but that

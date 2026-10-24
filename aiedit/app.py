@@ -1116,7 +1116,7 @@ class MainWindow(QMainWindow):
         problem = sandbox.available()
         self.act_terminal.setEnabled(not problem)
         self.act_terminal.setChecked(self.terminal_active())
-        self.act_terminal.setToolTip(problem)
+        self.act_terminal.setToolTip(problem or sandbox.experimental())
 
     def toggle_terminal(self):
         self.terminal_on = self.act_terminal.isChecked()
@@ -1124,6 +1124,8 @@ class MainWindow(QMainWindow):
         self.say("терминал для ИИ включён: команды идут в песочнице на копии проекта без закрытого кода и без сети, "
                  "каждую ты одобряешь" if self.terminal_on else
                  "терминал для ИИ выключен: агент проверяет работу только чтением кода")
+        if self.terminal_on and sandbox.experimental():
+            self.say(sandbox.experimental())
 
     def allowed_commands(self) -> list[str]:
         root = self.tree.root

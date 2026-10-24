@@ -7,9 +7,10 @@
 закрытого кода в выводе быть не может.
 В копию попадают и правки, которые агент уже предложил: он проверяет то, что написал.
 
-Песочница - bubblewrap (bwrap, только Linux): видна только копия, системные папки на чтение,
-без сети, без домашней папки, с пустым окружением (ключей API там нет) и ограничением по времени.
-То, что команда поменяла в копии, на диск не попадает. Каждую команду одобряет человек.
+Песочница: на Linux - bubblewrap (bwrap), на macOS - встроенный sandbox-exec (экспериментально).
+Видна только копия, системные папки на чтение, без сети, без домашней папки, с пустым окружением
+(ключей API там нет) и ограничением по времени. То, что команда поменяла в копии, на диск не
+попадает. Каждую команду одобряет человек. На Windows песочницы нет: редактор можно запустить в WSL.
 """
 import ast
 import os
@@ -162,19 +163,114 @@ def build_copy(ws: Workspace, dest: Path) -> list[str]:
 
 
 # --- песочница ---
+SEATBELT = "/usr/bin/sandbox-exec"
+
+
+def kind(platform: str | None = None) -> str:
+    """Какая песочница у этой системы: bwrap, seatbelt (macOS) или пусто."""
+    platform = platform or sys.platform
+    return "bwrap" if platform.startswith("linux") else "seatbelt" if platform == "darwin" else ""
+
+
 def available() -> str:
     """Пусто, если песочница работает; иначе причина для человека."""
     global _available
     if _available is None:
-        if not sys.platform.startswith("linux"):
-            _available = "песочница пока есть только на Linux"
-        elif not shutil.which("bwrap"):
-            _available = "не установлен bubblewrap (пакет bwrap)"
+        backend = kind()
+        if backend == "bwrap":
+            if not shutil.which("bwrap"):
+                _available = "не установлен bubblewrap (пакет bwrap)"
+            else:
+                res = checks.run_command(shlex.join(["bwrap", "--ro-bind", "/", "/", "--unshare-all", "true"]),
+                                         Path("/"), 10)
+                _available = "" if res.passed else f"bwrap не запускается: {res.output.strip() or res.error}"[:200]
+        elif backend == "seatbelt":
+            if not Path(SEATBELT).exists():
+                _available = "в системе нет sandbox-exec"
+            else:
+                with tempfile.TemporaryDirectory() as tmp:
+                    res = run_seatbelt("true", Path(tmp), timeout=10)
+                _available = "" if res.passed else f"sandbox-exec не запускается: {res.output.strip() or res.error}"[:200]
+        elif sys.platform.startswith("win"):
+            _available = "на Windows песочницы нет: запусти редактор в WSL (Linux внутри Windows), там она работает"
         else:
-            res = checks.run_command(shlex.join(["bwrap", "--ro-bind", "/", "/", "--unshare-all", "true"]),
-                                     Path("/"), 10)
-            _available = "" if res.passed else f"bwrap не запускается: {res.output.strip() or res.error}"[:200]
+            _available = "песочница есть только на Linux и macOS"
     return _available
+
+
+def experimental() -> str:
+    """Предупреждение для человека, если песочница этой системы проверена хуже."""
+    return ("песочница macOS (sandbox-exec) экспериментальная: её проверяли только тестами профиля, "
+            "не на настоящем Mac" if kind() == "seatbelt" else "")
+
+
+def _sb(path) -> str:
+    """Путь для профиля sandbox-exec: настоящий (macOS прячет /var за /private/var), в кавычках."""
+    real = os.path.realpath(path)
+    return '"' + real.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+# системные папки macOS, которые нужны, чтобы запускались sh и Python (только чтение)
+SEATBELT_SYSTEM = ("/usr", "/bin", "/sbin", "/System", "/Library", "/private/etc", "/private/var/db/dyld",
+                   "/dev", "/opt/homebrew", "/usr/local")
+# службы macOS, без которых не работают простые программы; буфер обмена и связка ключей сюда не входят
+SEATBELT_SERVICES = ("com.apple.system.logger", "com.apple.system.notification_center",
+                     "com.apple.system.opendirectoryd.libinfo")
+
+
+def seatbelt_profile(work: Path, tmp: Path, venv: Path | None = None, extra_ro=()) -> str:
+    """Профиль sandbox-exec: запрещено всё, кроме перечисленного. Ошибка в списке ломает запуск, а не защиту."""
+    readable = [*SEATBELT_SYSTEM, work, tmp, *extra_ro]
+    if venv is not None:
+        readable.append(venv)
+        base = venv_base(venv)
+        if base is not None:
+            readable.append(base)
+    reads = " ".join(f"(subpath {_sb(p)})" for p in readable)
+    services = " ".join(f'(global-name "{s}")' for s in SEATBELT_SERVICES)
+    return "\n".join([
+        "(version 1)", "(deny default)",
+        "(allow process-fork) (allow process-exec) (allow signal (target same-sandbox))",
+        "(allow sysctl-read) (allow file-read-metadata) (allow ipc-posix-shm)",
+        f"(allow mach-lookup {services})",
+        f'(allow file-read* (literal "/") {reads})',
+        f'(allow file-write* (subpath {_sb(work)}) (subpath {_sb(tmp)}) (literal "/dev/null") (literal "/dev/zero")'
+        ' (regex #"^/dev/tty"))',
+        "(deny network*)",
+    ])
+
+
+def seatbelt_argv(command: str, work: Path, tmp: Path, venv: Path | None = None, extra_ro=()) -> list[str]:
+    path = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
+    env = [f"HOME={os.path.realpath(tmp)}", f"TMPDIR={os.path.realpath(tmp)}", "LANG=en_US.UTF-8",
+           "PYTHONDONTWRITEBYTECODE=1"]
+    if venv is not None:
+        path = f"{venv}/bin:{path}"
+        env.append(f"VIRTUAL_ENV={venv}")
+    return ["/usr/bin/env", "-i", f"PATH={path}", *env, SEATBELT, "-p",
+            seatbelt_profile(work, tmp, venv, extra_ro), "/bin/sh", "-c", command]
+
+
+def run_seatbelt(command: str, work: Path, venv: Path | None = None, extra_ro: dict[str, Path] | None = None,
+                 timeout: float = TIMEOUT) -> checks.CheckResult:
+    links = []
+    for name, real in (extra_ro or {}).items():  # node_modules: ссылкой, читать можно по разрешению в профиле
+        link = work / name
+        if not link.exists():
+            link.symlink_to(real)
+            links.append(link)
+    with tempfile.TemporaryDirectory(prefix="aiedit-tmp-") as tmp:
+        res = checks.run_command(shlex.join(seatbelt_argv(command, work, Path(tmp), venv,
+                                                          list((extra_ro or {}).values()))), work, timeout)
+    for link in links:
+        link.unlink(missing_ok=True)
+    res.command = command
+    return res
+
+
+def run_sandboxed(command: str, work: Path, venv: Path | None = None, extra_ro: dict[str, Path] | None = None,
+                  timeout: float = TIMEOUT) -> checks.CheckResult:
+    return (run_seatbelt if kind() == "seatbelt" else run_bwrap)(command, work, venv, extra_ro, timeout)
 
 
 def bwrap_argv(command: str, work: Path, venv: Path | None = None, extra_ro: dict[str, Path] | None = None) -> list[str]:
@@ -298,7 +394,7 @@ class Terminal:
         except TooBig:
             return "ERROR: the project is too large for the sandbox"
         extra = {d: self.ws.root / d for d in ("node_modules",) if (self.ws.root / d).is_dir()}
-        res = (self.runner or run_bwrap)(command, self.work, project_venv(self.ws.root), extra, self.timeout)
+        res = (self.runner or run_sandboxed)(command, self.work, project_venv(self.ws.root), extra, self.timeout)
         self.runs += 1
         if self.show:
             self.show(res)

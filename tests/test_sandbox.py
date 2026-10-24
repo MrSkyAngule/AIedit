@@ -276,3 +276,65 @@ class RealSandboxTest(CopyCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SeatbeltTest(unittest.TestCase):
+    """Песочница macOS: здесь проверяется только профиль и команда - настоящего Mac в тестах нет."""
+
+    def test_profile_denies_by_default_and_has_no_home_or_network(self):
+        prof = sandbox.seatbelt_profile(Path("/tmp/work"), Path("/tmp/t"))
+        self.assertTrue(prof.startswith("(version 1)\n(deny default)"))
+        self.assertIn("(deny network*)", prof)
+        self.assertNotRegex(prof, r'"/(Users|home)(/|")')  # домашних папок нет (/opt/homebrew - не она)
+        self.assertNotIn("(allow mach-lookup)", prof)  # только перечисленные службы
+        self.assertNotIn("pasteboard", prof)
+        writes = prof.split("(allow file-write*")[1].split("\n")[0]
+        self.assertIn('(subpath "/tmp/work")', writes)
+        self.assertNotIn("/usr", writes)
+
+    def test_venv_and_its_python_are_readable(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            base = root / "pyhome"
+            (base / "bin").mkdir(parents=True)
+            venv = root / ".venv"
+            venv.mkdir()
+            (venv / "pyvenv.cfg").write_text(f"home = {base / 'bin'}\n")
+            prof = sandbox.seatbelt_profile(root / "w", root / "t", venv)
+            self.assertIn(f'(subpath "{os.path.realpath(venv)}")', prof)
+            self.assertIn(f'(subpath "{os.path.realpath(base)}")', prof)
+
+    def test_quotes_in_paths_cannot_break_the_profile(self):
+        self.assertEqual(sandbox._sb('/x/a"b'), '"/x/a\\"b"')
+
+    def test_argv_starts_with_empty_environment(self):
+        argv = sandbox.seatbelt_argv("pytest -q", Path("/tmp/w"), Path("/tmp/t"))
+        self.assertEqual(argv[:2], ["/usr/bin/env", "-i"])
+        self.assertEqual(argv[-3:], ["/bin/sh", "-c", "pytest -q"])
+        self.assertIn(sandbox.SEATBELT, argv)
+        self.assertFalse(any("API_KEY" in a for a in argv))
+
+    def test_backend_by_platform(self):
+        self.assertEqual([sandbox.kind(p) for p in ("linux", "darwin", "win32", "freebsd14")],
+                         ["bwrap", "seatbelt", "", ""])
+
+    def test_windows_points_to_wsl(self):
+        saved = (sandbox._available, sandbox.sys.platform)
+        try:
+            sandbox._available, sandbox.sys.platform = None, "win32"
+            self.assertIn("WSL", sandbox.available())
+        finally:
+            sandbox._available, sandbox.sys.platform = saved
+
+    def test_dispatch(self):
+        calls = []
+        saved = (sandbox.run_bwrap, sandbox.run_seatbelt, sandbox.sys.platform)
+        try:
+            sandbox.run_bwrap = lambda *a: calls.append("bwrap")
+            sandbox.run_seatbelt = lambda *a: calls.append("seatbelt")
+            for p in ("linux", "darwin"):
+                sandbox.sys.platform = p
+                sandbox.run_sandboxed("true", Path("/tmp"))
+        finally:
+            sandbox.run_bwrap, sandbox.run_seatbelt, sandbox.sys.platform = saved
+        self.assertEqual(calls, ["bwrap", "seatbelt"])

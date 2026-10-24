@@ -50,6 +50,7 @@ TOOLS: dict[str, dict] = {
     "ask_user": {"question": str},  # не инструмент рабочей области: отвечает человек
     "run_command": {"command": str},  # выполняет редактор, в песочнице (sandbox.Terminal)
     "fetch_url": {"url": str},  # открывает редактор, только сайты из списка или с одобрения (web.Web)
+    "web_search": {"query": str},  # поиск через Brave (search.Search)
     "install_packages": {"packages": str},  # ставит редактор, с одобрения (packages.Installer)
 }
 _SECTION_ARG = {"old": "old_text", "new": "new_text", "content": "content", "question": "question", "notes": "notes"}
@@ -167,6 +168,8 @@ def describe_call(call: Call) -> str:
         return f"запускаю в песочнице: {a.get('command', '?')[:120]}"
     if call.name == "fetch_url":
         return f"читаю страницу: {a.get('url', '?')[:120]}"
+    if call.name == "web_search":
+        return f"ищу в интернете: {a.get('query', '?')[:120]}"
     if call.name == "install_packages":
         return f"прошу установить: {a.get('packages', '?')[:120]}"
     return call.name
@@ -177,6 +180,7 @@ HELPED = {
     "run_command": ("command", "ERROR: no terminal here. Check your work by reading the code instead."),
     "fetch_url": ("url", "ERROR: no web access here. Rely on what you know and say what you are unsure about."),
     "install_packages": ("packages", "ERROR: installing packages is not available here. Tell the user what to install."),
+    "web_search": ("query", "ERROR: web search is not set up. Rely on what you know or ask the user for a link."),
 }
 
 
@@ -216,7 +220,8 @@ def run(task: str, ws: Workspace, provider: Provider, history: list | None = Non
         ask: Callable[[str], str | None] | None = None,
         terminal: Callable[[str], str] | None = None, web: Callable[[str], str] | None = None,
         install: Callable[[str], str] | None = None,
-        extend: Callable[[int, int], bool] | None = None) -> AgentResult:
+        extend: Callable[[int, int], bool] | None = None,
+        search: Callable[[str], str] | None = None) -> AgentResult:
     """Крутит цикл: запрос к модели, выполнение инструментов, ответ редактора, пока не будет итога.
     ask(вопрос) -> ответ человека или None; без ask модель не знает про ask_user и решает сама.
     terminal(команда) -> вывод для модели (sandbox.Terminal); без него run_command нет.
@@ -232,11 +237,12 @@ def run(task: str, ws: Workspace, provider: Provider, history: list | None = Non
     result = AgentResult("", [])
     asked = 0
     if ws.read_only:
-        terminal = web = install = None
-    helpers = {"run_command": terminal, "fetch_url": web, "install_packages": install}
+        terminal = web = install = search = None
+    helpers = {"run_command": terminal, "fetch_url": web, "install_packages": install, "web_search": search}
     system = prompts.agent_system(system or SYSTEM, [addon for on, addon in (
         (ask is not None, prompts.ASK_ADDON), (terminal is not None, prompts.TERMINAL_ADDON),
-        (web is not None, prompts.WEB_ADDON), (install is not None, prompts.INSTALL_ADDON)) if on])
+        (web is not None, prompts.WEB_ADDON), (search is not None and web is not None, prompts.SEARCH_ADDON),
+        (install is not None, prompts.INSTALL_ADDON)) if on])
     full_system = prompts.with_reply(system, english_reply)
     budget, step = max_steps, 0
     while True:

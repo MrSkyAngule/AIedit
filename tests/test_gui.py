@@ -1831,6 +1831,26 @@ class ProjectRulesGuiTest(GuiCase):
         self.assertEqual((self.root / "AGENTS.md").read_text(), "уже есть")
 
 
+class SearchGuiTest(GuiCase):
+    def test_search_needs_key_and_web(self):
+        from aiedit import search
+        w = self.window()
+        self.assertIsNone(w.make_searcher())
+        search.save_key("k")
+        s = w.make_searcher()
+        self.assertIsNotNone(s)
+        w.gate.set_words(["Газпром"])
+        asked = []
+        w.ask_search = lambda q, found: (asked.append(found), False)[1]
+        s.engine = lambda q, k: [{"title": "t", "url": "u", "description": "d"}]
+        self.assertEqual(s("отчёт газпром api"), search.OUT_DECLINED)
+        self.assertEqual(asked, [["слово из списка"]])
+        self.assertIn("1. t", s("flask docs"))
+        w.act_web.setChecked(False)
+        w.toggle_web()
+        self.assertIsNone(w.make_searcher())
+
+
 class TerminalGuiTest(GuiCase):
     def setUp(self):
         super().setUp()

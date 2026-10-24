@@ -102,6 +102,13 @@ Packages:
 """
 
 
+# добавляется к AGENT_SYSTEM, когда настроен поиск
+SEARCH_ADDON = """
+- web_search: query - searches the web and returns titles, links and short snippets. Then open a page with fetch_url if needed.
+- Search queries leave the machine: keep them generic (library names, error messages), never project code or private names.
+"""
+
+
 def agent_system(base: str, addons: list[str]) -> str:
     """Системный промпт агента с разделами про дополнительные инструменты, которые сейчас доступны."""
     extra = "".join(a.lstrip("\n") for a in addons)

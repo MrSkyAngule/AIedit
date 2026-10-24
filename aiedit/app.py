@@ -10,7 +10,7 @@ from .qt import (BINDING, QAction, QApplication, QDockWidget, QFileDialog, QKeyS
                  QInputDialog, QMainWindow, QMessageBox, Qt, QTabWidget, QTextCursor, QThread, QTimer, QVBoxLayout, QWidget,
                  Signal)
 from . import (agent, analysis, checkpoints, checks, journal, project_rules, conductor, flows, prompts, dialogs, guard, orchestrator, outbound, policy, related,
-               packages, sandbox, secrets_scan, sendlog, settings, web)
+               packages, sandbox, search, secrets_scan, sendlog, settings, web)
 from . import chatstore
 from .chat import ChatPanel
 from .document import Doc
@@ -52,7 +52,7 @@ class AgentWorker(QThread):
 
     def __init__(self, task, ws, provider, history, open_file, translator=None, roster=None,
                  conduct=False, review_on=False, analyze_on=False, approve_command=None, reader=None,
-                 approve_install=None, extend=None):
+                 approve_install=None, extend=None, searcher=None):
         super().__init__()
         self.args = (task, ws, provider, history, open_file)
         self.translator = translator
@@ -70,6 +70,7 @@ class AgentWorker(QThread):
         self.installer = (packages.Installer(ws.root, approve_install, self.command_done.emit)
                           if approve_install is not None else None)
         self.extend = extend  # спросить человека, продолжать ли после лимита шагов
+        self.searcher = searcher  # search.Search, если есть ключ поиска и интернет включён
 
     def ask(self, question: str) -> str | None:
         """Вопрос модели человеку: показываем в окне и ждём ответа. None - остановили, не дождавшись."""
@@ -92,13 +93,13 @@ class AgentWorker(QThread):
                                              on_progress=self.progress.emit, should_stop=lambda: self.cancel,
                                              review_on=self.review_on, analyze_on=self.analyze_on, ask=self.ask,
                                              terminal=self.terminal, web=self.reader, install=self.installer,
-                                             extend=self.ask_extend)
+                                             extend=self.ask_extend, search=self.searcher)
             else:
                 result = flows.run_agent(task, ws, provider, history, open_file, self.translator,
                                          on_progress=self.progress.emit, should_stop=lambda: self.cancel,
                                          roster=self.roster, review_on=self.review_on, analyze_on=self.analyze_on,
                                          ask=self.ask, terminal=self.terminal, web=self.reader,
-                                         install=self.installer, extend=self.ask_extend)
+                                         install=self.installer, extend=self.ask_extend, search=self.searcher)
             self.done.emit(result)
         except Exception as e:  # доступ закрыли по ходу работы, сеть, формат ответа
             self.failed.emit(f"{type(e).__name__}: {e}")
@@ -256,6 +257,7 @@ class MainWindow(QMainWindow):
         self.act_web.setCheckable(True)
         self.act_web.setChecked(self.web_on)
         self.action(ai, "Сайты, которые ИИ читает без вопроса...", self.edit_web_sites)
+        self.action(ai, "Ключ поиска в интернете (Brave Search)...", self.edit_search_key)
         self.act_install = self.action(ai, "ИИ может просить установить пакеты (pip, с подтверждением)",
                                        self.toggle_install)
         self.act_install.setCheckable(True)
@@ -1201,6 +1203,40 @@ class MainWindow(QMainWindow):
             settings.set_user(web_sites=self.web_sites)
             self.say(f"сайтов без вопроса: {len(self.web_sites)}")
 
+    def make_searcher(self) -> "search.Search | None":
+        key = search.load_key()
+        if not self.web_on or not key:
+            return None
+        return search.Search(key, lambda q, found: bool(self.in_window(self.ask_search, q, found)),
+                             lambda q: [f.kind for f in self.gate.find(q)], self.log_filter)
+
+    def edit_search_key(self):
+        from .qt import QLineEdit
+        key, ok = QInputDialog.getText(
+            self, "Поиск в интернете для ИИ",
+            "Ключ Brave Search API (бесплатный тариф: api-dashboard.search.brave.com).\n"
+            "Запросы ИИ будут уходить в Brave; фильтр исходящего проверяет каждый.\n"
+            "Пусто - выключить поиск.", QLineEdit.EchoMode.Password, search.load_key())
+        if not ok:
+            return
+        if not search.save_key(key):
+            self.say("не удалось сохранить ключ поиска (нет доступа к папке настроек)")
+        elif key.strip():
+            self.say("поиск в интернете включён: ИИ может искать, если включён «Интернет для ИИ»")
+        else:
+            self.say("поиск в интернете выключен")
+
+    def ask_search(self, query: str, found: list[str]) -> bool:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("ИИ хочет поискать в интернете")
+        box.setText(f"Запрос уйдёт в Brave:\n\n{query}")
+        box.setInformativeText("Фильтр исходящего нашёл в нём: " + ", ".join(sorted(set(found))))
+        go = box.addButton("Искать", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("Отказать", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        return box.clickedButton() is go
+
     def decide_web(self, url: str, found: list[str]) -> str:
         return self.in_window(self.approve_web, url, found)
 
@@ -1507,7 +1543,8 @@ class MainWindow(QMainWindow):
                                   self.active_translator(), self.gate.wrap_roster(self.roster), self.conductor_on,
                                   self.review_active(), self.analyze_on,
                                   self.decide_command if self.terminal_active() else None, self.make_reader(),
-                                  self.decide_install if self.install_on else None, self.decide_extend)
+                                  self.decide_install if self.install_on else None, self.decide_extend,
+                                  self.make_searcher())
         self.worker.progress.connect(self.say)
         self.worker.question.connect(self.on_question)
         self.worker.command_done.connect(self.show_command)

@@ -1794,6 +1794,31 @@ class InstallGuiTest(GuiCase):
         self.assertFalse(settings.get_user()["install"])
 
 
+class LongTaskGuiTest(GuiCase):
+    def test_window_asks_to_continue_and_shows_tokens(self):
+        from aiedit import agent as ag
+        w = self.window()
+        prov = Script([call("list_files")] * (ag.MAX_STEPS + 2) + ["Готово."])
+        w.providers = {"cheap": prov, "strong": prov}
+        asked = []
+        w.ask_extend = lambda steps, sent: (asked.append(steps), True)[1]
+        w.ask_ai("долгая задача")
+        self.wait(w)
+        self.assertEqual(asked, [ag.MAX_STEPS])
+        self.assertIn("Готово.", w.chat.history.toPlainText())
+        self.assertIn("тыс. токенов", w.chat.history.toPlainText())
+
+    def test_declined_stops(self):
+        from aiedit import agent as ag
+        w = self.window()
+        prov = Script([call("list_files")] * (ag.MAX_STEPS + 2))
+        w.providers = {"cheap": prov, "strong": prov}
+        w.ask_extend = lambda steps, sent: False
+        w.ask_ai("долгая задача")
+        self.wait(w)
+        self.assertIn("лимит шагов", w.chat.history.toPlainText())
+
+
 class TerminalGuiTest(GuiCase):
     def setUp(self):
         super().setUp()

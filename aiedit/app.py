@@ -52,7 +52,7 @@ class AgentWorker(QThread):
 
     def __init__(self, task, ws, provider, history, open_file, translator=None, roster=None,
                  conduct=False, review_on=False, analyze_on=False, approve_command=None, reader=None,
-                 approve_install=None):
+                 approve_install=None, extend=None):
         super().__init__()
         self.args = (task, ws, provider, history, open_file)
         self.translator = translator
@@ -69,6 +69,7 @@ class AgentWorker(QThread):
         self.reader = reader  # web.Web, если человек разрешил ИИ читать страницы документации
         self.installer = (packages.Installer(ws.root, approve_install, self.command_done.emit)
                           if approve_install is not None else None)
+        self.extend = extend  # спросить человека, продолжать ли после лимита шагов
 
     def ask(self, question: str) -> str | None:
         """Вопрос модели человеку: показываем в окне и ждём ответа. None - остановили, не дождавшись."""
@@ -80,6 +81,9 @@ class AgentWorker(QThread):
                 return None
         return self.answer
 
+    def ask_extend(self, steps: int, sent: int) -> bool:
+        return not self.cancel and self.extend is not None and bool(self.extend(steps, sent))
+
     def run(self):
         task, ws, provider, history, open_file = self.args
         try:
@@ -87,13 +91,14 @@ class AgentWorker(QThread):
                 result = flows.run_conductor(task, ws, self.roster, provider, history, open_file, self.translator,
                                              on_progress=self.progress.emit, should_stop=lambda: self.cancel,
                                              review_on=self.review_on, analyze_on=self.analyze_on, ask=self.ask,
-                                             terminal=self.terminal, web=self.reader, install=self.installer)
+                                             terminal=self.terminal, web=self.reader, install=self.installer,
+                                             extend=self.ask_extend)
             else:
                 result = flows.run_agent(task, ws, provider, history, open_file, self.translator,
                                          on_progress=self.progress.emit, should_stop=lambda: self.cancel,
                                          roster=self.roster, review_on=self.review_on, analyze_on=self.analyze_on,
                                          ask=self.ask, terminal=self.terminal, web=self.reader,
-                                         install=self.installer)
+                                         install=self.installer, extend=self.ask_extend)
             self.done.emit(result)
         except Exception as e:  # доступ закрыли по ходу работы, сеть, формат ответа
             self.failed.emit(f"{type(e).__name__}: {e}")
@@ -1198,6 +1203,23 @@ class MainWindow(QMainWindow):
     def decide_web(self, url: str, found: list[str]) -> str:
         return self.in_window(self.approve_web, url, found)
 
+    # --- длинные задачи ---
+    def decide_extend(self, steps: int, sent: int) -> bool:
+        return bool(self.in_window(self.ask_extend, steps, sent))
+
+    def ask_extend(self, steps: int, sent: int) -> bool:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Агент работает долго")
+        box.setText(f"Агент сделал {steps} шагов и ещё не закончил.")
+        box.setInformativeText(f"За эту задачу модели ушло около {sent // 4000} тыс. токенов (примерно: 4 символа "
+                               f"на токен). Ещё {agent.MAX_STEPS} шагов могут стоить столько же.\n\n"
+                               "Если остановить, то, что уже сделано, покажется на проверку как обычно.")
+        go = box.addButton(f"Продолжить (+{agent.MAX_STEPS} шагов)", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Остановить", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        return box.clickedButton() is go
+
     # --- установка пакетов ---
     def toggle_install(self):
         self.install_on = self.act_install.isChecked()
@@ -1467,7 +1489,7 @@ class MainWindow(QMainWindow):
                                   self.active_translator(), self.gate.wrap_roster(self.roster), self.conductor_on,
                                   self.review_active(), self.analyze_on,
                                   self.decide_command if self.terminal_active() else None, self.make_reader(),
-                                  self.decide_install if self.install_on else None)
+                                  self.decide_install if self.install_on else None, self.decide_extend)
         self.worker.progress.connect(self.say)
         self.worker.question.connect(self.on_question)
         self.worker.command_done.connect(self.show_command)
@@ -1516,6 +1538,8 @@ class MainWindow(QMainWindow):
         if isinstance(res, conductor.ConductResult) and res.plan is not None:
             workers = ", ".join(dict.fromkeys(t.worker for t in res.plan.tasks))
             meta = f"{self.agent_provider.name} · дирижёр · шагов плана: {len(res.plan.tasks)} ({workers}) · запросов: {res.steps}"
+        if res.sent:
+            meta += f" · ушло ~{max(1, res.sent // 4000)} тыс. токенов"
         if res.stopped:
             meta += f" · {res.stopped}"
         self.chat.add_ai(res.text or "Готово.", meta)

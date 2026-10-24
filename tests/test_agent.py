@@ -153,11 +153,13 @@ class LimitsTest(AgentCase):
         self.assertEqual(len(prov.seen), 1)
         self.assertEqual(res.stopped, "остановлено пользователем")
 
-    def test_output_volume_limit(self):
+    def test_big_reads_are_compacted_not_stopped(self):
         (self.root / "big.txt").write_text("x" * 59000)
-        reads = [tool("read_file", path="big.txt")] * 10
-        res, _, _ = self.go(reads)
-        self.assertIn("объёма", res.stopped)
+        reads = [tool("read_file", path="big.txt")] * 10 + ["done"]
+        res, prov, _ = self.go(reads)
+        self.assertEqual(res.stopped, "")
+        self.assertEqual(res.text, "done")
+        self.assertGreater(res.compactions, 0)
 
 
 class SafetyTest(AgentCase):

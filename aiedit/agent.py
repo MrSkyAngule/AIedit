@@ -24,19 +24,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from . import orchestrator, policy, prompts
+from . import context, orchestrator, policy, prompts
 from .providers import Provider
 from .workspace import Change, Workspace
 
-MAX_STEPS = 25
+MAX_STEPS = 40  # потом редактор спрашивает человека, продолжать ли (extend)
 MAX_CALLS_PER_REPLY = 8
-MAX_RESULT_CHARS = 250_000
+MAX_NOTES = 4000
 MAX_QUESTIONS = 3  # больше - значит модель перекладывает работу на человека
 
 SYSTEM = prompts.AGENT_SYSTEM
 
 _BLOCK = re.compile(r"^@@tool[ \t]+(\w+)[ \t]*\n(.*?)^@@end[ \t]*$", re.S | re.M)
-_SECTION = re.compile(r"^@@(old|new|content|question)[ \t]*$", re.M)
+_SECTION = re.compile(r"^@@(old|new|content|question|notes)[ \t]*$", re.M)
 
 TOOLS: dict[str, dict] = {
     "list_files": {"path": str, "depth": int},
@@ -46,12 +46,13 @@ TOOLS: dict[str, dict] = {
     "create_file": {"path": str, "content": str},
     "delete_file": {"path": str},
     "rename_file": {"path": str, "new_path": str},
+    "update_notes": {"notes": str},  # план агента: редактор хранит его и возвращает после сжатия
     "ask_user": {"question": str},  # не инструмент рабочей области: отвечает человек
     "run_command": {"command": str},  # выполняет редактор, в песочнице (sandbox.Terminal)
     "fetch_url": {"url": str},  # открывает редактор, только сайты из списка или с одобрения (web.Web)
     "install_packages": {"packages": str},  # ставит редактор, с одобрения (packages.Installer)
 }
-_SECTION_ARG = {"old": "old_text", "new": "new_text", "content": "content", "question": "question"}
+_SECTION_ARG = {"old": "old_text", "new": "new_text", "content": "content", "question": "question", "notes": "notes"}
 
 
 @dataclass
@@ -75,6 +76,9 @@ class AgentResult:
     review: object | None = None  # review.ReviewReport, если шла проверка безопасностью
     analysis: object | None = None  # analysis.AnalysisReport, если шёл статанализ
     authors: dict[str, str] = field(default_factory=dict)  # путь -> кто последним писал файл (для журнала правок)
+    sent: int = 0  # сколько символов ушло модели за все запросы (для человека: расход)
+    plan: str = ""  # последний план агента (update_notes)
+    compactions: int = 0  # сколько раз сжимали переписку
 
 
 def _coerce(value: str, kind):
@@ -155,6 +159,8 @@ def describe_call(call: Call) -> str:
         return f"предлагаю удалить {a.get('path', '?')}"
     if call.name == "rename_file":
         return f"предлагаю перенести {a.get('path', '?')} → {a.get('new_path', '?')}"
+    if call.name == "update_notes":
+        return "обновляю план"
     if call.name == "ask_user":
         return "задаю вопрос"
     if call.name == "run_command":
@@ -209,18 +215,21 @@ def run(task: str, ws: Workspace, provider: Provider, history: list | None = Non
         max_steps: int = MAX_STEPS, system: str | None = None,
         ask: Callable[[str], str | None] | None = None,
         terminal: Callable[[str], str] | None = None, web: Callable[[str], str] | None = None,
-        install: Callable[[str], str] | None = None) -> AgentResult:
+        install: Callable[[str], str] | None = None,
+        extend: Callable[[int, int], bool] | None = None) -> AgentResult:
     """Крутит цикл: запрос к модели, выполнение инструментов, ответ редактора, пока не будет итога.
     ask(вопрос) -> ответ человека или None; без ask модель не знает про ask_user и решает сама.
     terminal(команда) -> вывод для модели (sandbox.Terminal); без него run_command нет.
     web(адрес) -> текст страницы (web.Web); без него fetch_url нет.
-    install(пакеты) -> вывод pip (packages.Installer). Проверяющему (read_only) помощники не даются."""
+    install(пакеты) -> вывод pip (packages.Installer). Проверяющему (read_only) помощники не даются.
+    extend(шагов сделано, символов отправлено) -> продолжать ли, когда кончились max_steps шагов.
+    Длинная переписка сжимается (context.compact), так что задача не упирается в размер контекста."""
     say = on_progress or (lambda _: None)
     stop = should_stop or (lambda: False)
     first = first_message(task, ws, open_file)
     messages = orchestrator.build_messages(history, first)
+    start = len(messages)  # история и задача: при сжатии не трогаем
     result = AgentResult("", [])
-    spent = len(first)
     asked = 0
     if ws.read_only:
         terminal = web = install = None
@@ -228,13 +237,30 @@ def run(task: str, ws: Workspace, provider: Provider, history: list | None = Non
     system = prompts.agent_system(system or SYSTEM, [addon for on, addon in (
         (ask is not None, prompts.ASK_ADDON), (terminal is not None, prompts.TERMINAL_ADDON),
         (web is not None, prompts.WEB_ADDON), (install is not None, prompts.INSTALL_ADDON)) if on])
-    for step in range(1, max_steps + 1):
+    full_system = prompts.with_reply(system, english_reply)
+    budget, step = max_steps, 0
+    while True:
         if stop():
             result.stopped = "остановлено пользователем"
             break
+        if step >= budget:
+            if extend is not None and extend(step, result.sent):
+                budget += max_steps
+            else:
+                result.stopped = f"достигнут лимит шагов ({step})"
+                break
+        step += 1
         ws.recheck()
-        ws.log("agent", "", None, chars=len(SYSTEM) + sum(len(m["content"]) for m in messages))
-        reply = provider.complete(prompts.with_reply(system, english_reply), messages)
+        if context.compact(full_system, messages, start):
+            result.compactions += 1
+            say("переписка сжата: старые результаты убраны, план и список правок сохранены")
+            last = messages[-1]
+            messages[-1] = {**last, "content": last["content"] + "\n\n" + context.state_block(
+                ws.changes(), result.plan, ws.rel)}
+        sent = context.size(full_system, messages)
+        result.sent += sent
+        ws.log("agent", "", None, chars=sent)
+        reply = provider.complete(full_system, messages)
         result.steps = step
         calls, text = parse_calls(reply)
         if not calls:
@@ -250,18 +276,15 @@ def run(task: str, ws: Workspace, provider: Provider, history: list | None = Non
             if call.name == "ask_user":
                 out, used = ask_human(call, ask, asked)
                 asked += used
+            elif call.name == "update_notes":
+                result.plan = call.args.get("notes", "").strip()[:MAX_NOTES]
+                out = "notes saved" if result.plan else "ERROR: missing arguments: notes"
             elif call.name in HELPED:
                 out = run_helper(call, helpers[call.name])
             else:
                 out = execute(ws, call)
-            spent += len(out)
             blocks.append(f"@@result {call.name}\n{out}\n@@end")
         messages.append({"role": "user", "content": "\n\n".join(blocks)})
-        if spent > MAX_RESULT_CHARS:
-            result.stopped = "достигнут лимит объёма прочитанного"
-            break
-    else:
-        result.stopped = f"достигнут лимит шагов ({max_steps})"
     result.changes = ws.changes()
     if result.stopped and not result.text:
         result.text = f"Работа остановлена: {result.stopped}."

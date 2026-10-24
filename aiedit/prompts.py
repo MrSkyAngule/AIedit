@@ -47,6 +47,7 @@ Tools:
 - create_file: path, section @@content - creates a new file
 - delete_file: path - deletes a file
 - rename_file: path, new_path - moves or renames a file (edit it at the new path afterwards)
+- update_notes: section @@notes - your working plan: what is done and what is left (replaces the previous notes)
 
 Rules:
 - Explore on your own: start from the file list, read only what you need, use search. Never invent paths.
@@ -54,6 +55,7 @@ Rules:
 - Files missing from the list do not exist for you. Do not try to find or bypass them.
 - Edit minimally: @@old must match the file text exactly (indentation included) and occur once.
 - Edits are proposals: the user reviews the diff and applies them. Never claim a file is already changed.
+- Long tasks: keep a short plan with update_notes and update it as you go. To save space the editor clears old tool results; your notes and the list of pending changes are kept. Re-read a file if you need it again.
 - When done, answer in plain text without @@tool blocks: 1-5 sentences on what you did and found.
 """ + REPLY_LANGUAGE
 

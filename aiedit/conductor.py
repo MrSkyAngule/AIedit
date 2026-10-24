@@ -170,7 +170,7 @@ def make_plan(task: str, ws: Workspace, roster: Roster, provider: Provider, hist
     return parse_plan(reply, ws, roster, task, protected=bool(ws.protected_overview()))
 
 
-MAX_TOTAL_STEPS = 60
+MAX_TOTAL_STEPS = 120
 
 
 @dataclass
@@ -270,6 +270,7 @@ def run(task: str, ws: Workspace, roster: Roster, conductor: Provider, history: 
             say(f"{t.id}: ошибка исполнителя {worker.key}: {type(e).__name__}: {e}")
             continue
         out.steps += r.steps
+        out.sent += r.sent
         authors.update({p: worker for p, st in ws.states.items() if st.text != before.get(p, st.base)})
         out.calls += [f"{t.id}: {c}" for c in r.calls]
         text = r.text if r.from_model else f"stopped: {r.stopped}"

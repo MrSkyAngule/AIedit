@@ -31,11 +31,12 @@ from .workspace import Change, Workspace
 MAX_STEPS = 25
 MAX_CALLS_PER_REPLY = 8
 MAX_RESULT_CHARS = 250_000
+MAX_QUESTIONS = 3  # больше - значит модель перекладывает работу на человека
 
 SYSTEM = prompts.AGENT_SYSTEM
 
 _BLOCK = re.compile(r"^@@tool[ \t]+(\w+)[ \t]*\n(.*?)^@@end[ \t]*$", re.S | re.M)
-_SECTION = re.compile(r"^@@(old|new|content)[ \t]*$", re.M)
+_SECTION = re.compile(r"^@@(old|new|content|question)[ \t]*$", re.M)
 
 TOOLS: dict[str, dict] = {
     "list_files": {"path": str, "depth": int},
@@ -43,8 +44,9 @@ TOOLS: dict[str, dict] = {
     "search": {"query": str, "path": str, "case": bool},
     "edit_file": {"path": str, "old_text": str, "new_text": str},
     "create_file": {"path": str, "content": str},
+    "ask_user": {"question": str},  # не инструмент рабочей области: отвечает человек
 }
-_SECTION_ARG = {"old": "old_text", "new": "new_text", "content": "content"}
+_SECTION_ARG = {"old": "old_text", "new": "new_text", "content": "content", "question": "question"}
 
 
 @dataclass
@@ -143,7 +145,24 @@ def describe_call(call: Call) -> str:
         return f"предлагаю правку в {a.get('path', '?')}"
     if call.name == "create_file":
         return f"предлагаю новый файл {a.get('path', '?')}"
+    if call.name == "ask_user":
+        return "задаю вопрос"
     return call.name
+
+
+def ask_human(call: Call, ask: Callable[[str], str | None] | None, asked: int) -> tuple[str, bool]:
+    """Вопрос человеку. Возвращает (что увидит модель: ответ или почему его нет, был ли вопрос задан)."""
+    if call.error:
+        return f"ERROR: {call.error}", False
+    question = call.args.get("question", "").strip()
+    if not question:
+        return "ERROR: missing arguments: question", False
+    if ask is None:
+        return prompts.OUT_ASK_UNAVAILABLE, False
+    if asked >= MAX_QUESTIONS:
+        return prompts.OUT_ASK_LIMIT, False
+    answer = ask(question)
+    return (answer.strip() if answer and answer.strip() else prompts.OUT_NO_ANSWER), True
 
 
 def first_message(task: str, ws: Workspace, open_file: Path | None = None) -> str:
@@ -156,21 +175,25 @@ def first_message(task: str, ws: Workspace, open_file: Path | None = None) -> st
 def run(task: str, ws: Workspace, provider: Provider, history: list | None = None,
         open_file: Path | None = None, on_progress: Callable[[str], None] | None = None,
         should_stop: Callable[[], bool] | None = None, english_reply: bool = False,
-        max_steps: int = MAX_STEPS, system: str | None = None) -> AgentResult:
-    """Крутит цикл: запрос к модели, выполнение инструментов, ответ редактора, пока не будет итога."""
+        max_steps: int = MAX_STEPS, system: str | None = None,
+        ask: Callable[[str], str | None] | None = None) -> AgentResult:
+    """Крутит цикл: запрос к модели, выполнение инструментов, ответ редактора, пока не будет итога.
+    ask(вопрос) -> ответ человека или None; без ask модель не знает про ask_user и решает сама."""
     say = on_progress or (lambda _: None)
     stop = should_stop or (lambda: False)
     first = first_message(task, ws, open_file)
     messages = orchestrator.build_messages(history, first)
     result = AgentResult("", [])
     spent = len(first)
+    asked = 0
+    system = prompts.agent_system(system or SYSTEM, ask is not None)
     for step in range(1, max_steps + 1):
         if stop():
             result.stopped = "остановлено пользователем"
             break
         ws.recheck()
         ws.log("agent", "", None, chars=len(SYSTEM) + sum(len(m["content"]) for m in messages))
-        reply = provider.complete(prompts.with_reply(system or SYSTEM, english_reply), messages)
+        reply = provider.complete(prompts.with_reply(system, english_reply), messages)
         result.steps = step
         calls, text = parse_calls(reply)
         if not calls:
@@ -182,7 +205,11 @@ def run(task: str, ws: Workspace, provider: Provider, history: list | None = Non
             note = describe_call(call)
             result.calls.append(note)
             say(note)
-            out = execute(ws, call)
+            if call.name == "ask_user":
+                out, used = ask_human(call, ask, asked)
+                asked += used
+            else:
+                out = execute(ws, call)
             spent += len(out)
             blocks.append(f"@@result {call.name}\n{out}\n@@end")
         messages.append({"role": "user", "content": "\n\n".join(blocks)})

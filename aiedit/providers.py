@@ -20,7 +20,7 @@ class DemoProvider(Provider):
     def __init__(self, name="demo"):
         self.name = name
 
-    def _agent_step(self, messages: list[dict]) -> str:
+    def _agent_step(self, messages: list[dict], system: str = "") -> str:
         """Простой сценарий без модели: посмотреть проект, прочитать файл, при слове «комментар» добавить строку."""
         first = messages[0]["content"]
         task = first.split("\n\n=== PROJECT FILES")[0]
@@ -30,6 +30,11 @@ class DemoProvider(Provider):
         target = next((l for l in top if l.endswith(".py")), top[0] if top else None)
         if target is None:
             return f"[{self.name}] Демо-агент: в проекте нет файлов."
+        if "спроси" in task.lower() and "ask_user" in system:  # показать вопрос человеку без ключей
+            if steps == 0:
+                return f"@@tool ask_user\nquestion: Демо-вопрос: какой файл посмотреть? Например, {target}\n@@end"
+            answer = messages[-1]["content"].partition("@@result ask_user\n")[2].partition("\n@@end")[0]
+            return f"[{self.name}] Демо-агент: ты ответил «{answer}». С ключами здесь продолжилась бы работа."
         if steps == 0:
             return f"Сначала прочитаю {target}.\n@@tool read_file\npath: {target}\n@@end"
         read = messages[-1]["content"]
@@ -67,7 +72,7 @@ class DemoProvider(Provider):
         if "Mode: conductor" in system:
             return self._conductor_plan(messages)
         if "Mode: agent" in system:
-            return self._agent_step(messages)
+            return self._agent_step(messages, system)
         task, _, code = messages[-1]["content"].partition("\n=== FILE ===\n")
         memory = f" Реплик в памяти: {len(messages) - 1}."
         if "Mode: explain" in system:

@@ -1593,6 +1593,64 @@ class ZonePersistenceTest(GuiCase):
         self.assertNotEqual(side.stat().st_mtime_ns, 1)
 
 
+class AskGuiTest(GuiCase):
+    def agent(self, replies):
+        w = self.window()
+        prov = Script(replies)
+        w.providers = {"cheap": prov, "strong": prov}
+        w.review_changes = lambda items: [True] * len(items)
+        return w, prov
+
+    @staticmethod
+    def until_question(w):
+        for _ in range(500):
+            app.processEvents()
+            if w.waiting is not None or w.worker is None:
+                return
+            w.worker.wait(10)
+
+    def test_question_in_chat_answer_from_input_and_work_continues(self):
+        w, prov = self.agent([call("ask_user", question="Какой файл: a.py или b.py?"),
+                              edit("b.py", "y = 2", "y = 3"), "Поправил b.py."])
+        w.ask_ai("поправь значение")
+        self.until_question(w)
+        self.assertIsNotNone(w.waiting)
+        self.assertIn("Какой файл: a.py или b.py?", w.chat.history.toPlainText())
+        self.assertTrue(w.ask_btn.isEnabled())  # можно отвечать
+        self.assertFalse(w.explain_btn.isEnabled())
+        w.chat.input.setPlainText("b.py")
+        w.chat.submit()
+        self.assertIsNone(w.waiting)
+        self.wait(w)
+        self.assertIn("@@result ask_user\nb.py\n@@end", prov.everything())
+        self.assertEqual((self.root / "b.py").read_text(), "y = 3\n")
+        self.assertEqual(len(w.history), 2)  # ответ на вопрос - не новая задача
+        self.assertEqual(w.history[0].text, "поправь значение")
+        self.assertIn("Поправил b.py.", w.chat.history.toPlainText())
+
+    def test_stop_while_waiting(self):
+        w, prov = self.agent([call("ask_user", question="Какой?"), "не должно быть"])
+        w.ask_ai("поправь")
+        self.until_question(w)
+        w.stop_agent()
+        self.wait(w)
+        self.assertIsNone(w.worker)
+        self.assertIsNone(w.waiting)
+        self.assertEqual(len(prov.seen), 1)
+        self.assertIn("остановлено", w.chat.history.toPlainText())
+
+    def test_answer_goes_through_outbound_filter(self):
+        key = "sk-ant-api03-AbCdEf0123456789xyz"
+        w, prov = self.agent([call("ask_user", question="Какой ключ?"), "ок"])
+        w.ask_outbound = lambda findings, model: "mask"
+        w.ask_ai("подключи сервис")
+        self.until_question(w)
+        w.ask_ai(f"вот он {key}")
+        self.wait(w)
+        self.assertNotIn(key, prov.everything())
+        self.assertIn("вот он <<masked-1>>", prov.everything())
+
+
 class OutboundGuiTest(GuiCase):
     KEY = "sk-ant-api03-AbCdEf0123456789xyz"
 

@@ -53,6 +53,11 @@ to the model: they are missing from listings, search and reads.
 zone and path filters; every proposed edit is checked against the zones by a diff before
 you see it. Nothing is written to disk without your approval.
 
+**Asks instead of guessing.** When a task is ambiguous (which file, what behavior, what to do with
+existing data), the agent can call `ask_user`: the work pauses, the question shows up in the chat,
+you answer in the normal input box, and the agent continues with its context intact. At most
+3 questions per run; the reviewer never asks.
+
 **Secrets.** Lines that look like keys, tokens or private keys are hidden automatically.
 Output of tests and analyzers is scrubbed before it goes back to a model.
 

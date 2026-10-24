@@ -43,16 +43,28 @@ def _answer_to_ru(text: str, tr: Translator | None, notes: list[str], on_progres
     return text
 
 
+def _asker(ask, tr: Translator | None, notes: list[str]):
+    """Вопрос модели человеку на его языке, ответ человека модели - на её."""
+    if ask is None:
+        return None
+
+    def asked(question: str) -> str | None:
+        answer = ask(_answer_to_ru(question, tr, notes))
+        return None if answer is None else _task_to_en(answer, tr, notes)
+    return asked
+
+
 def run_agent(task: str, ws, provider, history: list | None = None, open_file: Path | None = None,
               translator: Translator | None = None, on_progress: Callable[[str], None] | None = None,
               should_stop: Callable[[], bool] | None = None, roster=None, review_on: bool = False,
-              author=None, analyze_on: bool = False) -> agent.AgentResult:
+              author=None, analyze_on: bool = False, ask=None) -> agent.AgentResult:
     """Один агент. Если дан реестр с проверяющим и review_on, правки после работы проверяются, а замечания
-    возвращаются автору (author - его исполнитель, по умолчанию та модель, что писала код)."""
+    возвращаются автору (author - его исполнитель, по умолчанию та модель, что писала код).
+    ask(вопрос) -> ответ человека или None: если дан, агент может переспросить, когда задача неоднозначна."""
     notes: list[str] = []
     en_task = _task_to_en(task, translator, notes, on_progress)
     res = agent.run(en_task, ws, provider, history, open_file, on_progress, should_stop,
-                    english_reply=translator is not None)
+                    english_reply=translator is not None, ask=_asker(ask, translator, notes))
     from .roster import Worker
     who = author or Worker("agent", provider, "", 0, 0, "mid")  # автор правок - та модель, что реально писала код
     if analyze_on and not res.stopped and ws.changes():
@@ -76,12 +88,13 @@ def run_conductor(task: str, ws, roster, conductor_provider, history: list | Non
                   open_file: Path | None = None, translator: Translator | None = None,
                   on_progress: Callable[[str], None] | None = None,
                   should_stop: Callable[[], bool] | None = None, review_on: bool = True,
-                  analyze_on: bool = True) -> conductor.ConductResult:
+                  analyze_on: bool = True, ask=None) -> conductor.ConductResult:
     """Дирижёр с переводом: задача уходит по-английски, итог плана возвращается человеку по-русски."""
     notes: list[str] = []
     en_task = _task_to_en(task, translator, notes, on_progress)
     res = conductor.run(en_task, ws, roster, conductor_provider, history, open_file, on_progress, should_stop,
-                        english_reply=translator is not None, review_on=review_on, analyze_on=analyze_on)
+                        english_reply=translator is not None, review_on=review_on, analyze_on=analyze_on,
+                        ask=_asker(ask, translator, notes))
     res.task_en = en_task if en_task != task else ""
     res.text_en = res.text
     res.text = _answer_to_ru(res.text_en, translator, notes, on_progress)

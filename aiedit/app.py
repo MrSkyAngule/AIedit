@@ -1,6 +1,7 @@
 """Редактор (PyQt6 или PySide6): код без служебных меток, зоны в колонке слева, панель ИИ."""
 import os
 import sys
+import threading
 from pathlib import Path
 
 from .searchdialog import SearchDialog
@@ -41,8 +42,9 @@ class Worker(QThread):
 
 
 class AgentWorker(QThread):
-    """Крутит агента в отдельном потоке. Отмена проверяется между шагами."""
+    """Крутит агента в отдельном потоке. Отмена проверяется между шагами и пока ждём ответа человека."""
     progress = Signal(str)
+    question = Signal(str)
     done = Signal(object)
     failed = Signal(str)
 
@@ -56,6 +58,18 @@ class AgentWorker(QThread):
         self.review_on = review_on
         self.analyze_on = analyze_on
         self.cancel = False
+        self.answer: str | None = None
+        self.answered = threading.Event()
+
+    def ask(self, question: str) -> str | None:
+        """Вопрос модели человеку: показываем в окне и ждём ответа. None - остановили, не дождавшись."""
+        self.answer = None
+        self.answered.clear()
+        self.question.emit(question)
+        while not self.answered.wait(0.1):
+            if self.cancel:
+                return None
+        return self.answer
 
     def run(self):
         task, ws, provider, history, open_file = self.args
@@ -63,11 +77,12 @@ class AgentWorker(QThread):
             if self.conduct:
                 result = flows.run_conductor(task, ws, self.roster, provider, history, open_file, self.translator,
                                              on_progress=self.progress.emit, should_stop=lambda: self.cancel,
-                                             review_on=self.review_on, analyze_on=self.analyze_on)
+                                             review_on=self.review_on, analyze_on=self.analyze_on, ask=self.ask)
             else:
                 result = flows.run_agent(task, ws, provider, history, open_file, self.translator,
                                          on_progress=self.progress.emit, should_stop=lambda: self.cancel,
-                                         roster=self.roster, review_on=self.review_on, analyze_on=self.analyze_on)
+                                         roster=self.roster, review_on=self.review_on, analyze_on=self.analyze_on,
+                                         ask=self.ask)
             self.done.emit(result)
         except Exception as e:  # доступ закрыли по ходу работы, сеть, формат ответа
             self.failed.emit(f"{type(e).__name__}: {e}")
@@ -94,6 +109,7 @@ class MainWindow(QMainWindow):
         self.last_doc: Doc | None = None  # последний файл, с которым работали (когда открыта вкладка журнала)
         self.applied: list = []        # (изменение, имя файла), реально применённые в последнем запросе
         self.worker: Worker | None = None
+        self.waiting: AgentWorker | None = None  # агент задал вопрос и ждёт ответа из чата
         self.ai_blocked = False  # текущий файл закрыт от ИИ правилами папки
         self.highlight = "fill"
         self.acknowledged: set[Path | None] = set()  # папки, где предупреждение уже принято
@@ -907,8 +923,11 @@ class MainWindow(QMainWindow):
         self.say("новый чат: память очищена")
 
     def ask_ai(self, task: str):
-        """Отправка из чата: при открытой папке работает агент по всему проекту, иначе один файл."""
-        if self.tree.root is not None:
+        """Отправка из чата: при открытой папке работает агент по всему проекту, иначе один файл.
+        Если агент задал вопрос, то, что написано, - ответ ему, а не новая задача."""
+        if self.waiting is not None:
+            self.answer_question(task)
+        elif self.tree.root is not None:
             self.ask_agent(task)
         else:
             self.ask_file(task)
@@ -1260,13 +1279,39 @@ class MainWindow(QMainWindow):
                                   self.active_translator(), self.gate.wrap_roster(self.roster), self.conductor_on,
                                   self.review_active(), self.analyze_on)
         self.worker.progress.connect(self.say)
+        self.worker.question.connect(self.on_question)
         self.worker.done.connect(self.on_agent_done)
         self.worker.failed.connect(self.on_fail)
         self.worker.start()
 
+    def on_question(self, question: str):
+        """Агент переспрашивает: показываем вопрос и даём ответить в обычном поле ввода."""
+        if not isinstance(self.worker, AgentWorker):
+            return
+        self.waiting = self.worker
+        self.chat.add_ai(question, "вопрос от ИИ · ответь в поле ввода, работа продолжится")
+        self.chat.set_busy(True, "ИИ ждёт ответа...", can_stop=True)
+        self.ask_btn.setEnabled(True)
+        self.chat.input.setFocus()
+
+    def answer_question(self, text: str):
+        text = text.strip()
+        worker, self.waiting = self.waiting, None
+        if not text or worker is None:
+            return
+        self.chat.add_user(text)
+        self.watch_task(text)  # ответ уходит модели: фильтр проверит и его
+        self.ask_btn.setEnabled(False)
+        self.chat.set_busy(True, "Агент работает...", can_stop=True)
+        worker.answer = text
+        worker.answered.set()
+
     def stop_agent(self):
         if isinstance(self.worker, AgentWorker):
             self.worker.cancel = True
+            if self.waiting is not None:
+                self.waiting = None
+                self.ask_btn.setEnabled(False)
             self.say("останавливаю агента после текущего шага...")
 
     def review_changes(self, items: list[dict]) -> list[bool]:
@@ -1393,6 +1438,7 @@ class MainWindow(QMainWindow):
 
     def finish(self):
         self.worker = None
+        self.waiting = None
         self.chat.set_busy(False)
         self.refresh_access()
 

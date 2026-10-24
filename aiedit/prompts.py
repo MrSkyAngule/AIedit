@@ -55,6 +55,25 @@ Rules:
 - When done, answer in plain text without @@tool blocks: 1-5 sentences on what you did and found.
 """ + REPLY_LANGUAGE
 
+# добавляется к AGENT_SYSTEM, когда рядом есть человек, который может ответить
+ASK_ADDON = """
+Asking the user:
+- ask_user: question (or section @@question) - pauses the work until the user answers; the answer comes back as the result.
+- Ask before editing if the task is ambiguous in a way that changes the result: which file or function, what behavior is wanted, what to do with existing data or callers.
+- One short concrete question per call; offer 2-3 options when you can.
+- Do not ask about what you can find in the project yourself, and do not ask for approval: the user reviews every edit anyway.
+"""
+OUT_NO_ANSWER = "The user did not answer. Proceed with the most reasonable assumption and state it in your final answer."
+OUT_ASK_UNAVAILABLE = "Nobody can answer here. Decide yourself and state your assumption in your final answer."
+OUT_ASK_LIMIT = "Question limit reached. Decide yourself and state your assumptions in your final answer."
+
+
+def agent_system(base: str, can_ask: bool) -> str:
+    """Системный промпт агента: с инструментом ask_user, только если есть кому отвечать."""
+    if not can_ask:
+        return base
+    return base.removesuffix(REPLY_LANGUAGE) + ASK_ADDON.lstrip("\n") + REPLY_LANGUAGE
+
 # --- разделы сообщений ---
 SEC_ZONES = "=== ZONES ==="
 SEC_FILE = "=== FILE ==="

@@ -1640,8 +1640,9 @@ class MainWindow(QMainWindow):
         if isinstance(res, conductor.ConductResult) and res.plan is not None:
             workers = ", ".join(dict.fromkeys(t.worker for t in res.plan.tasks))
             meta = f"{self.agent_provider.name} · дирижёр · шагов плана: {len(res.plan.tasks)} ({workers}) · запросов: {res.steps}"
-        if res.sent:
-            meta += f" · ушло ~{max(1, res.sent // 4000)} тыс. токенов"
+        spent = agent.usage_text(res.usage, res.sent)
+        if spent:
+            meta += f" · {spent}"
         if res.stopped:
             meta += f" · {res.stopped}"
         self.chat.add_ai(res.text or "Готово.", meta)

@@ -78,6 +78,7 @@ class AgentResult:
     analysis: object | None = None  # analysis.AnalysisReport, если шёл статанализ
     authors: dict[str, str] = field(default_factory=dict)  # путь -> кто последним писал файл (для журнала правок)
     sent: int = 0  # сколько символов ушло модели за все запросы (для человека: расход)
+    usage: dict = field(default_factory=dict)  # точный расход по ответам API: input, cache_read, cache_write, output
     plan: str = ""  # последний план агента (update_notes)
     compactions: int = 0  # сколько раз сжимали переписку
 
@@ -206,6 +207,23 @@ def ask_human(call: Call, ask: Callable[[str], str | None] | None, asked: int) -
     return (answer.strip() if answer and answer.strip() else prompts.OUT_NO_ANSWER), True
 
 
+def add_usage(total: dict, part: dict | None):
+    for k, v in (part or {}).items():
+        total[k] = total.get(k, 0) + v
+
+
+def usage_text(usage: dict, sent_chars: int = 0) -> str:
+    """Для человека: точный расход, если API его сообщил, иначе прикидка по символам."""
+    if not usage:
+        return f"ушло ~{max(1, sent_chars // 4000)} тыс. токенов" if sent_chars else ""
+    k = lambda n: f"{n / 1000:.1f}".rstrip("0").rstrip(".") + " тыс."  # noqa: E731
+    total_in = usage.get("input", 0) + usage.get("cache_read", 0) + usage.get("cache_write", 0)
+    text = f"токены: вход {k(total_in)}"
+    if usage.get("cache_read"):
+        text += f" (из кэша {k(usage['cache_read'])}, {round(100 * usage['cache_read'] / max(total_in, 1))}%)"
+    return text + f", ответ {k(usage.get('output', 0))}"
+
+
 def first_message(task: str, ws: Workspace, open_file: Path | None = None) -> str:
     """Первое сообщение модели: задача, список файлов проекта, имя открытого файла и правила проекта."""
     tree = ws.list_files(".", 2)
@@ -267,6 +285,7 @@ def run(task: str, ws: Workspace, provider: Provider, history: list | None = Non
         result.sent += sent
         ws.log("agent", "", None, chars=sent)
         reply = provider.complete(full_system, messages)
+        add_usage(result.usage, getattr(provider, "last_usage", None))
         result.steps = step
         calls, text = parse_calls(reply)
         if not calls:

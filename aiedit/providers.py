@@ -9,6 +9,7 @@ import urllib.request
 
 class Provider:
     name = "base"
+    last_usage: dict | None = None  # расход последнего запроса: input, cache_read, cache_write, output (токены)
 
     def complete(self, system: str, messages: list[dict]) -> str:
         raise NotImplementedError
@@ -84,11 +85,16 @@ class DemoProvider(Provider):
 
 class AnthropicProvider(Provider):
     """Messages API по HTTPS. effort ("low"..."max") ограничивает глубину рассуждений: для быстрых
-    коротких задач вроде планирования ставим "low". Параметры sampling не передаём: их новые модели не принимают."""
+    коротких задач вроде планирования ставим "low". Параметры sampling не передаём: их новые модели не принимают.
+
+    Кэширование промпта: метка на системном промпте (он одинаковый на всех шагах и у всех исполнителей
+    одной модели) и автоматическая метка на конце переписки - каждый шаг агента читает из кэша всё,
+    что было до него. Чтение из кэша стоит около 0.1 обычной цены, запись - 1.25."""
     URL = "https://api.anthropic.com/v1/messages"
 
     def __init__(self, model: str, api_key: str, effort: str | None = None, max_tokens: int = 8192,
-                 url: str | None = None, timeout: float = 120):
+                 url: str | None = None, timeout: float = 120, cache: bool = True):
+        self.cache = cache
         self.name = model
         self.model = model
         self.api_key = api_key
@@ -99,9 +105,18 @@ class AnthropicProvider(Provider):
 
     def request_body(self, system: str, messages: list[dict]) -> dict:
         body = {"model": self.model, "max_tokens": self.max_tokens, "system": system, "messages": messages}
+        if self.cache:
+            body["system"] = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+            body["cache_control"] = {"type": "ephemeral"}  # автоматически: на последнем блоке переписки
         if self.effort:
             body["output_config"] = {"effort": self.effort}
         return body
+
+    @staticmethod
+    def usage(data: dict) -> dict:
+        u = data.get("usage") or {}
+        return {"input": u.get("input_tokens", 0), "cache_read": u.get("cache_read_input_tokens") or 0,
+                "cache_write": u.get("cache_creation_input_tokens") or 0, "output": u.get("output_tokens", 0)}
 
     def complete(self, system: str, messages: list[dict]) -> str:
         req = urllib.request.Request(
@@ -110,6 +125,7 @@ class AnthropicProvider(Provider):
                      "content-type": "application/json"})
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             data = json.load(resp)
+        self.last_usage = self.usage(data)
         return "".join(p.get("text", "") for p in data["content"] if p.get("type", "text") == "text")
 
 
@@ -145,7 +161,16 @@ class OpenAIProvider(Provider):
                                      headers=headers)
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             data = json.load(resp)
+        self.last_usage = self.usage(data)
         return data["choices"][0]["message"].get("content") or ""
+
+    @staticmethod
+    def usage(data: dict) -> dict:
+        """OpenAI кэширует длинные одинаковые начала запросов сама; сколько взято из кэша - в prompt_tokens_details."""
+        u = data.get("usage") or {}
+        cached = (u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
+        return {"input": max(0, (u.get("prompt_tokens") or 0) - cached), "cache_read": cached, "cache_write": 0,
+                "output": u.get("completion_tokens") or 0}
 
 
 def default_providers() -> dict[str, Provider]:

@@ -271,6 +271,7 @@ def run(task: str, ws: Workspace, roster: Roster, conductor: Provider, history: 
             continue
         out.steps += r.steps
         out.sent += r.sent
+        agent.add_usage(out.usage, r.usage)
         authors.update({p: worker for p, st in ws.states.items() if st.text != before.get(p, st.base)})
         out.calls += [f"{t.id}: {c}" for c in r.calls]
         text = r.text if r.from_model else f"stopped: {r.stopped}"

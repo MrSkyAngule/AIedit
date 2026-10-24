@@ -204,7 +204,8 @@ def run(task: str, ws: Workspace, provider: Provider, history: list | None = Non
         for call in calls:
             note = describe_call(call)
             result.calls.append(note)
-            say(note)
+            if call.name != "ask_user":  # сам вопрос человек и так увидит
+                say(note)
             if call.name == "ask_user":
                 out, used = ask_human(call, ask, asked)
                 asked += used

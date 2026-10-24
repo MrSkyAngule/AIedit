@@ -46,6 +46,7 @@ class ChatInput(QPlainTextEdit):
 
 
 class ChatPanel(QWidget):
+    PLACEHOLDER = "Напиши задачу для ИИ (Enter - отправить, Shift+Enter - новая строка)"
     sent = Signal(str)
     explainRequested = Signal()
     clearRequested = Signal()
@@ -68,7 +69,7 @@ class ChatPanel(QWidget):
         busy.addWidget(self.stop_btn)
         self.busy_row.hide()
         self.input = ChatInput()
-        self.input.setPlaceholderText("Напиши задачу для ИИ (Enter - отправить, Shift+Enter - новая строка)")
+        self.input.setPlaceholderText(self.PLACEHOLDER)
         self.input.setFixedHeight(72)
         self.input.submitted.connect(self.submit)
         self.send_btn = QPushButton("Отправить")

@@ -1618,9 +1618,12 @@ class AskGuiTest(GuiCase):
         self.assertIn("Какой файл: a.py или b.py?", w.chat.history.toPlainText())
         self.assertTrue(w.ask_btn.isEnabled())  # можно отвечать
         self.assertFalse(w.explain_btn.isEnabled())
+        self.assertIn("Ответь на вопрос", w.chat.input.placeholderText())
+        self.assertNotIn("задаю вопрос", w.chat.history.toPlainText())
         w.chat.input.setPlainText("b.py")
         w.chat.submit()
         self.assertIsNone(w.waiting)
+        self.assertEqual(w.chat.input.placeholderText(), w.chat.PLACEHOLDER)
         self.wait(w)
         self.assertIn("@@result ask_user\nb.py\n@@end", prov.everything())
         self.assertEqual((self.root / "b.py").read_text(), "y = 3\n")

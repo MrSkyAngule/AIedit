@@ -1289,8 +1289,9 @@ class MainWindow(QMainWindow):
         if not isinstance(self.worker, AgentWorker):
             return
         self.waiting = self.worker
-        self.chat.add_ai(question, "вопрос от ИИ · ответь в поле ввода, работа продолжится")
+        self.chat.add_ai(question, "вопрос от ИИ")
         self.chat.set_busy(True, "ИИ ждёт ответа...", can_stop=True)
+        self.chat.input.setPlaceholderText("Ответь на вопрос ИИ: работа продолжится с того же места")
         self.ask_btn.setEnabled(True)
         self.chat.input.setFocus()
 
@@ -1300,6 +1301,7 @@ class MainWindow(QMainWindow):
         if not text or worker is None:
             return
         self.chat.add_user(text)
+        self.chat.input.setPlaceholderText(ChatPanel.PLACEHOLDER)
         self.watch_task(text)  # ответ уходит модели: фильтр проверит и его
         self.ask_btn.setEnabled(False)
         self.chat.set_busy(True, "Агент работает...", can_stop=True)
@@ -1439,6 +1441,7 @@ class MainWindow(QMainWindow):
     def finish(self):
         self.worker = None
         self.waiting = None
+        self.chat.input.setPlaceholderText(ChatPanel.PLACEHOLDER)
         self.chat.set_busy(False)
         self.refresh_access()
 

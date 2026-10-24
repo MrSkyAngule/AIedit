@@ -23,6 +23,9 @@ if QApplication is not None:
     from aiedit.translator import Translator
 
     app = QApplication.instance() or QApplication([])
+    import importlib
+    from aiedit.qt import BINDING
+    DEFERRED_DELETE = importlib.import_module(f"{BINDING}.QtCore").QEvent.Type.DeferredDelete
 
 
 class Top(Provider if QApplication else object):
@@ -52,8 +55,20 @@ class GuiCase(unittest.TestCase):
 
     def tearDown(self):
         for w in self.windows:
+            for t in (w.worker, w.check_worker, *w.note_workers):
+                if t:
+                    t.wait()
             w.docs.clear()
-            w.close()
+        self.windows.clear()
+        # все окна, включая созданные в тестах мимо self.window(), удаляем, пока Qt жив:
+        # иначе PySide6 уничтожает их после QApplication и иногда падает при выходе из Python
+        for top in [t for t in app.topLevelWidgets() if t.parent() is None]:  # диалоги уйдут вместе с родителем
+            if hasattr(top, "docs"):
+                top.docs.clear()  # окно не спрашивает про несохранённое
+            top.close()
+            top.deleteLater()
+        app.sendPostedEvents(None, DEFERRED_DELETE)
+        app.processEvents()
         os.environ.pop("AIEDIT_CONFIG_DIR", None)
         for k, v in self.saved_keys.items():
             if v:
@@ -786,7 +801,6 @@ class ConnectionsGuiTest(GuiCase):
         from aiedit.connections_dialog import ConnectionsDialog
         kw = {"ping_fn": ping_fn} if ping_fn else {}
         dlg = ConnectionsDialog(None, list(rows), roles or Roles(), **kw)
-        self.addCleanup(dlg.close)
         return dlg
 
     @staticmethod
@@ -1304,7 +1318,6 @@ class JournalGuiTest(GuiCase):
     def view(self, hunks=None, goto=None):
         from aiedit.journal_dialog import JournalView
         v = JournalView(None, self.hunks() if hunks is None else hunks, goto or (lambda f, l: None))
-        self.addCleanup(v.close)
         return v
 
     def test_files_are_sorted_by_total_size_and_places_inside_by_size(self):

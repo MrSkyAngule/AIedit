@@ -1,0 +1,25 @@
+{
+ "sha256": "99d51b49ffa5d633625f628eb95048e6f367dd4800003f14f471f5c57feadd32",
+ "regions": [
+  [
+   "hidden",
+   3,
+   5
+  ],
+  [
+   "readonly",
+   7,
+   8
+  ],
+  [
+   "confirm",
+   10,
+   11
+  ],
+  [
+   "explain",
+   13,
+   14
+  ]
+ ]
+}

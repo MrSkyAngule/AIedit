@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
+
+# личные служебные файлы редактора: чат и журнал отправок не для репозитория
+.aiedit-chat.json
+.aiedit-sends.jsonl
+
+# черновики
+/test.py

@@ -1,4 +1,5 @@
 """Редактор (PyQt6 или PySide6): код без служебных меток, зоны в колонке слева, панель ИИ."""
+import json
 import os
 import sys
 import threading
@@ -8,7 +9,7 @@ from .searchdialog import SearchDialog
 from .qt import (BINDING, QAction, QApplication, QDockWidget, QFileDialog, QKeySequence,
                  QInputDialog, QMainWindow, QMessageBox, Qt, QTabWidget, QTextCursor, QThread, QTimer, QVBoxLayout, QWidget,
                  Signal)
-from . import (agent, analysis, checks, journal, conductor, flows, prompts, dialogs, guard, orchestrator, outbound, policy, related,
+from . import (agent, analysis, checkpoints, checks, journal, conductor, flows, prompts, dialogs, guard, orchestrator, outbound, policy, related,
                sandbox, secrets_scan, sendlog, settings)
 from . import chatstore
 from .chat import ChatPanel
@@ -19,7 +20,7 @@ from .folder_dialog import FolderDialog
 from .marks import Marks, sidecar
 from .policy import Rules
 from .translator import Translator
-from .workspace import Workspace, write_change
+from .workspace import Change, Workspace, write_change
 from . import connections
 from .connections_dialog import ConnectionsDialog
 from .journal_dialog import JournalView
@@ -244,6 +245,7 @@ class MainWindow(QMainWindow):
         self.act_translate.setCheckable(True)
         self.refresh_translate_action()
         self.action(ai, "Журнал правок ИИ...", self.open_journal)
+        self.action(ai, "Откатить работу ИИ...", self.rollback)
         self.act_journal = self.action(ai, "Открывать журнал правок после работы ИИ", self.toggle_journal)
         self.act_journal.setCheckable(True)
         self.act_journal.setChecked(self.journal_on)
@@ -1470,9 +1472,12 @@ class MainWindow(QMainWindow):
         flags = self.review_changes(items)
         done, skipped, skipped_en = [], [], []
         self.applied = []
+        saved: list[checkpoints.FileBefore] = []
         for ch, ok, item in zip(changes, flags, items):
             if not ok:
                 continue
+            before = checkpoints.FileBefore(str(ch.path), ch.old, None if ch.deleted else ch.new,
+                                            self.regions_before(ch))
             reason = self.write_one(ch)
             if reason:
                 skipped.append(f"{item['name']} ({reason[0]})")
@@ -1480,6 +1485,12 @@ class MainWindow(QMainWindow):
             else:
                 done.append(item["name"])
                 self.applied.append((ch, item["name"]))
+                saved.append(before)
+        if saved and self.tree.root is not None:
+            if checkpoints.save(self.tree.root, self.sent_task, saved):
+                self.say("точка отката сохранена: вернуть как было - ИИ → Откатить работу ИИ...")
+            else:
+                self.say("точку отката сохранить не удалось (нет доступа к папке настроек)")
         for line in skipped:
             self.say(f"не применено: {line}")
         if done:
@@ -1503,17 +1514,7 @@ class MainWindow(QMainWindow):
         if doc is not None:
             if doc.text() != ch.old:
                 return "изменился в редакторе, пока работал агент", "changed in the editor while the agent worked"
-            doc.marks.remember(ch.old)
-            doc.silent = True
-            cur = doc.editor.textCursor()
-            cur.beginEditBlock()
-            cur.select(QTextCursor.SelectionType.Document)
-            cur.insertText(ch.new)
-            cur.endEditBlock()
-            doc.silent = False
-            doc.block_count = doc.editor.blockCount()
-            doc.marks.items = list(ch.regions)
-            doc.paint()
+            self.set_doc_text(doc, ch.new, ch.regions)
             return None
         try:
             now = ch.path.read_text(encoding="utf-8") if ch.path.exists() else None
@@ -1524,6 +1525,111 @@ class MainWindow(QMainWindow):
         except (OSError, UnicodeDecodeError) as e:
             return str(e), str(e)
         return None
+
+    @staticmethod
+    def set_doc_text(doc, text: str, regions):
+        """Весь текст вкладки одним шагом отмены (Ctrl+Z вернёт прежний вместе с зонами)."""
+        doc.marks.remember(doc.text())
+        doc.silent = True
+        cur = doc.editor.textCursor()
+        cur.beginEditBlock()
+        cur.select(QTextCursor.SelectionType.Document)
+        cur.insertText(text)
+        cur.endEditBlock()
+        doc.silent = False
+        doc.block_count = doc.editor.blockCount()
+        doc.marks.items = list(regions)
+        doc.paint()
+
+    def doc_for(self, path: Path):
+        real = Path(os.path.realpath(path))
+        return next((d for d in self.docs if d.path and Path(os.path.realpath(d.path)) == real), None)
+
+    def regions_before(self, ch) -> str | None:
+        """Зоны файла до правки (JSON), чтобы откат вернул и их."""
+        doc = self.doc_for(ch.path)
+        if doc is not None:
+            regions = list(doc.marks.items)
+        elif ch.old is not None:
+            m = Marks()
+            regions = m.items if m.load(ch.path, ch.old) else []
+        else:
+            return None
+        return json.dumps([[r.level, r.start, r.end, r.note, r.note_en] for r in regions], ensure_ascii=False)
+
+    # --- откат ---
+    def rollback(self):
+        root = self.tree.root
+        points = checkpoints.load(root) if root is not None else []
+        if not points:
+            self.say("откатывать нечего: точки появляются, когда применяешь правки ИИ в папке проекта")
+            return
+        labels = [p.label() for p in points]
+        label, ok = QInputDialog.getItem(self, "Откатить работу ИИ", "Какую работу вернуть как было (новые сверху):",
+                                         labels, 0, False)
+        if ok and label in labels:
+            self.restore_point(points[labels.index(label)])
+
+    def current_text(self, path: Path) -> str | None:
+        doc = self.doc_for(path)
+        if doc is not None:
+            return doc.text()
+        try:
+            return path.read_text(encoding="utf-8") if path.is_file() else None
+        except (OSError, UnicodeDecodeError):
+            return None
+
+    def confirm_rollback(self, point, changed: list[str]) -> bool:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning if changed else QMessageBox.Icon.Question)
+        box.setWindowTitle("Откатить работу ИИ")
+        box.setText(f"Вернуть {len(point.files)} файл(ов) к виду до правок ИИ?\n«{point.title[:120]}»")
+        info = "\n".join(f"• {self.make_ws_label(Path(f.path))}" for f in point.files[:12])
+        if changed:
+            info += ("\n\nПосле ИИ эти файлы меняли, их изменения пропадут:\n"
+                     + "\n".join(f"• {n}" for n in changed[:12]))
+        box.setInformativeText(info)
+        go = box.addButton("Откатить", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        return box.clickedButton() is go
+
+    def restore_point(self, point):
+        changed = [self.make_ws_label(Path(f.path)) for f in point.files if self.current_text(Path(f.path)) != f.after]
+        if not self.confirm_rollback(point, changed):
+            return
+        failed = []
+        for f in point.files:
+            path = Path(f.path)
+            try:
+                self.restore_file(path, f)
+            except (OSError, ValueError) as e:
+                failed.append(f"{self.make_ws_label(path)} ({e})")
+        checkpoints.forget(self.tree.root, point)
+        self.refresh_access()
+        self.say(f"откачено файлов: {len(point.files) - len(failed)}"
+                 + ("; не вышло: " + ", ".join(failed) if failed else ""))
+        if self.history:  # модель должна знать, что её правки убраны
+            last = self.history[-1]
+            note = "[the user rolled back the AI edits of an earlier request]"
+            self.history[-1] = orchestrator.Turn(last.role, f"{last.text}\n{note}", last.source,
+                                                 f"{last.en}\n{note}" if last.en else None)
+            self.save_chat()
+
+    def restore_file(self, path: Path, f):
+        regions = [guard.Region(*r) for r in json.loads(f.marks_before)] if f.marks_before else []
+        doc = self.doc_for(path)
+        if f.before is None:  # ИИ создал файл - убираем
+            if doc is not None:
+                doc.editor.document().setModified(False)
+                self.close_tab(self.tabs.indexOf(doc.editor))
+            path.unlink(missing_ok=True)
+            sidecar(path).unlink(missing_ok=True)
+            return
+        if doc is not None:
+            self.set_doc_text(doc, f.before, regions)
+            return
+        write_change(Change(path, None, f.before, regions, [], False))
 
     def delete_one(self, ch, doc) -> tuple[str, str] | None:
         """Удаление файла по предложению ИИ: только если он не менялся с тех пор, как его прочитал агент."""

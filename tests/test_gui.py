@@ -1638,6 +1638,73 @@ class DeleteGuiTest(GuiCase):
         self.assertIn("не применено: b.py", w.chat.history.toPlainText())
 
 
+class RollbackGuiTest(GuiCase):
+    def agent(self, replies, open_file="a.py"):
+        w = self.window(open_file)
+        prov = Script(replies)
+        w.providers = {"cheap": prov, "strong": prov}
+        w.review_changes = lambda items: [True] * len(items)
+        w.confirm_rollback = lambda point, changed: (self.changed.append(changed), True)[1]
+        self.changed = []
+        return w, prov
+
+    def pick_latest(self, w):
+        from aiedit import checkpoints
+        w.restore_point(checkpoints.load(self.root)[0])
+
+    def test_rollback_restores_edit_create_and_delete(self):
+        w, _ = self.agent([edit("b.py", "y = 2", "y = 3") + "\n" + call("delete_file", path="pkg/util.py")
+                           + "\n@@tool create_file\npath: new.py\n@@content\nz = 1\n@@end", "Готово."])
+        w.ask_ai("поменяй")
+        self.wait(w)
+        self.assertIn("точка отката сохранена", w.chat.history.toPlainText())
+        self.assertEqual((self.root / "b.py").read_text(), "y = 3\n")
+        self.pick_latest(w)
+        self.assertEqual(self.changed, [[]])  # после ИИ никто не трогал
+        self.assertEqual((self.root / "b.py").read_text(), "y = 2\n")
+        self.assertEqual((self.root / "pkg" / "util.py").read_text(), "def u():\n    return 'TOKEN_VALUE'\n")
+        self.assertFalse((self.root / "new.py").exists())
+        self.assertIn("откачено файлов: 3", w.chat.history.toPlainText())
+        self.assertIn("rolled back", w.history[-1].text)
+        from aiedit import checkpoints
+        self.assertEqual(checkpoints.load(self.root), [])
+
+    def test_open_tab_is_rolled_back_with_zones_and_undo(self):
+        w, _ = self.agent([edit("a.py", "return 2", "return 20"), "Готово."])
+        w.marks.add("readonly", 0, 1)
+        w.ask_ai("поменяй g")
+        self.wait(w)
+        self.assertIn("return 20", w.editor.toPlainText())
+        w.marks.clear(0, 1)  # человек снял зону после работы ИИ
+        self.pick_latest(w)
+        self.assertIn("return 2\n", w.editor.toPlainText())
+        self.assertEqual(self.zones(w), [("readonly", 0, 1)])  # зоны - как были до правки
+        w.undo()
+        self.assertIn("return 20", w.editor.toPlainText())  # откат отката - обычным Ctrl+Z
+
+    def test_files_changed_after_ai_are_reported(self):
+        w, _ = self.agent([edit("b.py", "y = 2", "y = 3"), "Готово."], open_file=None)
+        w.ask_ai("поменяй")
+        self.wait(w)
+        (self.root / "b.py").write_text("y = 4\n")
+        self.pick_latest(w)
+        self.assertEqual(self.changed, [["b.py"]])
+        self.assertEqual((self.root / "b.py").read_text(), "y = 2\n")
+
+    def test_cancel_keeps_everything(self):
+        w, _ = self.agent([edit("b.py", "y = 2", "y = 3"), "Готово."])
+        w.confirm_rollback = lambda point, changed: False
+        w.ask_ai("поменяй")
+        self.wait(w)
+        self.pick_latest(w)
+        self.assertEqual((self.root / "b.py").read_text(), "y = 3\n")
+
+    def test_nothing_to_roll_back(self):
+        w, _ = self.agent([])
+        w.rollback()
+        self.assertIn("откатывать нечего", w.chat.history.toPlainText())
+
+
 class TerminalGuiTest(GuiCase):
     def setUp(self):
         super().setUp()

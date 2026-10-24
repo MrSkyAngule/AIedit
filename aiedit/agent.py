@@ -49,6 +49,7 @@ TOOLS: dict[str, dict] = {
     "ask_user": {"question": str},  # не инструмент рабочей области: отвечает человек
     "run_command": {"command": str},  # выполняет редактор, в песочнице (sandbox.Terminal)
     "fetch_url": {"url": str},  # открывает редактор, только сайты из списка или с одобрения (web.Web)
+    "install_packages": {"packages": str},  # ставит редактор, с одобрения (packages.Installer)
 }
 _SECTION_ARG = {"old": "old_text", "new": "new_text", "content": "content", "question": "question"}
 
@@ -160,6 +161,8 @@ def describe_call(call: Call) -> str:
         return f"запускаю в песочнице: {a.get('command', '?')[:120]}"
     if call.name == "fetch_url":
         return f"читаю страницу: {a.get('url', '?')[:120]}"
+    if call.name == "install_packages":
+        return f"прошу установить: {a.get('packages', '?')[:120]}"
     return call.name
 
 
@@ -167,6 +170,7 @@ def describe_call(call: Call) -> str:
 HELPED = {
     "run_command": ("command", "ERROR: no terminal here. Check your work by reading the code instead."),
     "fetch_url": ("url", "ERROR: no web access here. Rely on what you know and say what you are unsure about."),
+    "install_packages": ("packages", "ERROR: installing packages is not available here. Tell the user what to install."),
 }
 
 
@@ -204,11 +208,13 @@ def run(task: str, ws: Workspace, provider: Provider, history: list | None = Non
         should_stop: Callable[[], bool] | None = None, english_reply: bool = False,
         max_steps: int = MAX_STEPS, system: str | None = None,
         ask: Callable[[str], str | None] | None = None,
-        terminal: Callable[[str], str] | None = None, web: Callable[[str], str] | None = None) -> AgentResult:
+        terminal: Callable[[str], str] | None = None, web: Callable[[str], str] | None = None,
+        install: Callable[[str], str] | None = None) -> AgentResult:
     """Крутит цикл: запрос к модели, выполнение инструментов, ответ редактора, пока не будет итога.
     ask(вопрос) -> ответ человека или None; без ask модель не знает про ask_user и решает сама.
     terminal(команда) -> вывод для модели (sandbox.Terminal); без него run_command нет.
-    web(адрес) -> текст страницы (web.Web); без него fetch_url нет. Проверяющему (read_only) они не даются."""
+    web(адрес) -> текст страницы (web.Web); без него fetch_url нет.
+    install(пакеты) -> вывод pip (packages.Installer). Проверяющему (read_only) помощники не даются."""
     say = on_progress or (lambda _: None)
     stop = should_stop or (lambda: False)
     first = first_message(task, ws, open_file)
@@ -217,11 +223,11 @@ def run(task: str, ws: Workspace, provider: Provider, history: list | None = Non
     spent = len(first)
     asked = 0
     if ws.read_only:
-        terminal = web = None
-    helpers = {"run_command": terminal, "fetch_url": web}
+        terminal = web = install = None
+    helpers = {"run_command": terminal, "fetch_url": web, "install_packages": install}
     system = prompts.agent_system(system or SYSTEM, [addon for on, addon in (
         (ask is not None, prompts.ASK_ADDON), (terminal is not None, prompts.TERMINAL_ADDON),
-        (web is not None, prompts.WEB_ADDON)) if on])
+        (web is not None, prompts.WEB_ADDON), (install is not None, prompts.INSTALL_ADDON)) if on])
     for step in range(1, max_steps + 1):
         if stop():
             result.stopped = "остановлено пользователем"

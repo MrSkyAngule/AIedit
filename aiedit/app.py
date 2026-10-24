@@ -10,7 +10,7 @@ from .qt import (BINDING, QAction, QApplication, QDockWidget, QFileDialog, QKeyS
                  QInputDialog, QMainWindow, QMessageBox, Qt, QTabWidget, QTextCursor, QThread, QTimer, QVBoxLayout, QWidget,
                  Signal)
 from . import (agent, analysis, checkpoints, checks, journal, conductor, flows, prompts, dialogs, guard, orchestrator, outbound, policy, related,
-               sandbox, secrets_scan, sendlog, settings, web)
+               packages, sandbox, secrets_scan, sendlog, settings, web)
 from . import chatstore
 from .chat import ChatPanel
 from .document import Doc
@@ -51,7 +51,8 @@ class AgentWorker(QThread):
     failed = Signal(str)
 
     def __init__(self, task, ws, provider, history, open_file, translator=None, roster=None,
-                 conduct=False, review_on=False, analyze_on=False, approve_command=None, reader=None):
+                 conduct=False, review_on=False, analyze_on=False, approve_command=None, reader=None,
+                 approve_install=None):
         super().__init__()
         self.args = (task, ws, provider, history, open_file)
         self.translator = translator
@@ -66,6 +67,8 @@ class AgentWorker(QThread):
         self.terminal = (sandbox.Terminal(ws, approve_command, self.command_done.emit)
                          if approve_command is not None else None)
         self.reader = reader  # web.Web, если человек разрешил ИИ читать страницы документации
+        self.installer = (packages.Installer(ws.root, approve_install, self.command_done.emit)
+                          if approve_install is not None else None)
 
     def ask(self, question: str) -> str | None:
         """Вопрос модели человеку: показываем в окне и ждём ответа. None - остановили, не дождавшись."""
@@ -84,12 +87,13 @@ class AgentWorker(QThread):
                 result = flows.run_conductor(task, ws, self.roster, provider, history, open_file, self.translator,
                                              on_progress=self.progress.emit, should_stop=lambda: self.cancel,
                                              review_on=self.review_on, analyze_on=self.analyze_on, ask=self.ask,
-                                             terminal=self.terminal, web=self.reader)
+                                             terminal=self.terminal, web=self.reader, install=self.installer)
             else:
                 result = flows.run_agent(task, ws, provider, history, open_file, self.translator,
                                          on_progress=self.progress.emit, should_stop=lambda: self.cancel,
                                          roster=self.roster, review_on=self.review_on, analyze_on=self.analyze_on,
-                                         ask=self.ask, terminal=self.terminal, web=self.reader)
+                                         ask=self.ask, terminal=self.terminal, web=self.reader,
+                                         install=self.installer)
             self.done.emit(result)
         except Exception as e:  # доступ закрыли по ходу работы, сеть, формат ответа
             self.failed.emit(f"{type(e).__name__}: {e}")
@@ -99,19 +103,16 @@ class AgentWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    outboundAsk = Signal(object)  # вопрос фильтра исходящего из рабочего потока в окно
-    commandAsk = Signal(object)   # вопрос «выполнить команду?» из рабочего потока в окно
-    webAsk = Signal(object)       # вопрос «открыть страницу?» из рабочего потока в окно
+    mainCall = Signal(object)  # вопрос человеку из потока агента: выполняется в окне, поток ждёт ответа
 
     def __init__(self):
         super().__init__()
         user = settings.get_user()
         self.gate = outbound.Gate(user.get("outbound_words", []), self.decide_outbound, self.log_filter,
                                   bool(user.get("outbound", True)))
-        self.outboundAsk.connect(self.answer_outbound, Qt.ConnectionType.BlockingQueuedConnection)
-        self.commandAsk.connect(self.answer_command, Qt.ConnectionType.BlockingQueuedConnection)
+        self.mainCall.connect(self.run_in_window, Qt.ConnectionType.BlockingQueuedConnection)
         self.terminal_on = bool(user.get("terminal", True))
-        self.webAsk.connect(self.answer_web, Qt.ConnectionType.BlockingQueuedConnection)
+        self.install_on = bool(user.get("install", True))
         self.web_on = bool(user.get("web", True))
         self.web_sites: list[str] = list(user.get("web_sites", web.DEFAULT_SITES))
         self.translator: Translator | None = None
@@ -249,6 +250,10 @@ class MainWindow(QMainWindow):
         self.act_web.setCheckable(True)
         self.act_web.setChecked(self.web_on)
         self.action(ai, "Сайты, которые ИИ читает без вопроса...", self.edit_web_sites)
+        self.act_install = self.action(ai, "ИИ может просить установить пакеты (pip, с подтверждением)",
+                                       self.toggle_install)
+        self.act_install.setCheckable(True)
+        self.act_install.setChecked(self.install_on)
         ai.addSeparator()
         self.act_translate = self.action(ai, "Переводить задачи и ответы", self.toggle_translate)
         self.act_translate.setCheckable(True)
@@ -1033,16 +1038,21 @@ class MainWindow(QMainWindow):
         return True
 
     # --- фильтр исходящего ---
-    def decide_outbound(self, findings: list[outbound.Finding], model: str) -> str:
-        """Вызывается из потока запроса: окно можно показать только из главного, туда и передаём."""
+    def in_window(self, fn, *args):
+        """Вызов из потока запроса: окна можно показывать только в главном потоке, туда и передаём.
+        Поток ждёт ответа. Если вызов упал, ответ None - вызывающий считает это отказом."""
         if QThread.currentThread() == self.thread():
-            return self.ask_outbound(findings, model)
-        box = {"findings": findings, "model": model, "answer": "cancel"}
-        self.outboundAsk.emit(box)  # ждёт, пока человек ответит
-        return box["answer"]
+            return fn(*args)
+        box = {"fn": fn, "args": args, "result": None}
+        self.mainCall.emit(box)
+        return box["result"]
 
-    def answer_outbound(self, box: dict):
-        box["answer"] = self.ask_outbound(box["findings"], box["model"])
+    @staticmethod
+    def run_in_window(box: dict):
+        box["result"] = box["fn"](*box["args"])
+
+    def decide_outbound(self, findings: list[outbound.Finding], model: str) -> str:
+        return self.in_window(self.ask_outbound, findings, model)
 
     def ask_outbound(self, findings: list[outbound.Finding], model: str) -> str:
         """mask, send или cancel."""
@@ -1127,15 +1137,8 @@ class MainWindow(QMainWindow):
             self.say("без вопроса: " + (", ".join(words) if words else "ничего, спрашивать про каждую команду"))
 
     def decide_command(self, command: str) -> str:
-        """Из потока агента: run или deny. Окно - только в главном потоке."""
-        if QThread.currentThread() == self.thread():
-            return self.approve_command(command)
-        box = {"command": command, "answer": "deny"}
-        self.commandAsk.emit(box)  # ждёт ответа человека
-        return box["answer"]
-
-    def answer_command(self, box: dict):
-        box["answer"] = self.approve_command(box["command"])
+        """Из потока агента: run или deny."""
+        return self.in_window(self.approve_command, command)
 
     def approve_command(self, command: str) -> str:
         if sandbox.preapproved(command, self.allowed_commands()):
@@ -1193,14 +1196,32 @@ class MainWindow(QMainWindow):
             self.say(f"сайтов без вопроса: {len(self.web_sites)}")
 
     def decide_web(self, url: str, found: list[str]) -> str:
-        if QThread.currentThread() == self.thread():
-            return self.approve_web(url, found)
-        box = {"url": url, "found": found, "answer": "deny"}
-        self.webAsk.emit(box)
-        return box["answer"]
+        return self.in_window(self.approve_web, url, found)
 
-    def answer_web(self, box: dict):
-        box["answer"] = self.approve_web(box["url"], box["found"])
+    # --- установка пакетов ---
+    def toggle_install(self):
+        self.install_on = self.act_install.isChecked()
+        settings.set_user(install=self.install_on)
+        self.say("ИИ может просить установить пакеты: каждый раз спрошу тебя, ставятся только готовые сборки"
+                 if self.install_on else "ИИ больше не может просить установку пакетов")
+
+    def decide_install(self, venv: Path, names: list[str]) -> bool:
+        return bool(self.in_window(self.ask_install, venv, names))
+
+    def ask_install(self, venv: Path, names: list[str]) -> bool:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("ИИ просит установить пакеты")
+        box.setText("Установить в окружение проекта " + self.make_ws_label(venv) + "?\n\n" + "\n".join(names))
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setInformativeText(
+            "Ставятся только готовые сборки (wheel): при установке код пакетов не выполняется.\n"
+            "Проверь названия: бывают подделки под известные пакеты. Страницы на PyPI:\n"
+            + "\n".join(f"https://pypi.org/project/{packages.name_of(n)}/" for n in names))
+        go = box.addButton("Установить", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Отказать", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        return box.clickedButton() is go
 
     def approve_web(self, url: str, found: list[str]) -> str:
         answer = self.ask_web(url, found)
@@ -1445,7 +1466,8 @@ class MainWindow(QMainWindow):
         self.worker = AgentWorker(task, self.make_workspace(), self.gate.wrap(provider), list(self.history), self.path,
                                   self.active_translator(), self.gate.wrap_roster(self.roster), self.conductor_on,
                                   self.review_active(), self.analyze_on,
-                                  self.decide_command if self.terminal_active() else None, self.make_reader())
+                                  self.decide_command if self.terminal_active() else None, self.make_reader(),
+                                  self.decide_install if self.install_on else None)
         self.worker.progress.connect(self.say)
         self.worker.question.connect(self.on_question)
         self.worker.command_done.connect(self.show_command)

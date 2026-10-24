@@ -1760,6 +1760,40 @@ class WebGuiTest(GuiCase):
         self.assertNotIn("fetch_url", prov.systems[0])
 
 
+class InstallGuiTest(GuiCase):
+    def test_install_asks_in_window_and_shows_output(self):
+        from aiedit import checks
+        (self.root / ".venv" / "bin").mkdir(parents=True)
+        (self.root / ".venv" / "bin" / "python").write_text("")
+        w = self.window()
+        prov = Script([call("install_packages", packages="flask"), "ок"])
+        w.providers = {"cheap": prov, "strong": prov}
+        asked = []
+        w.ask_install = lambda venv, names: (asked.append((venv.name, names)), True)[1]
+        ran = []
+        orig = checks.run_command
+        checks.run_command = lambda command, cwd, timeout=0: (ran.append(command),
+                                                             checks.CheckResult(command, 0, "Successfully installed", 1))[1]
+        self.addCleanup(setattr, checks, "run_command", orig)
+        w.ask_ai("поставь flask")
+        self.wait(w)
+        self.assertEqual(asked, [(".venv", ["flask"])])
+        self.assertIn("--only-binary", ran[0])
+        self.assertIn("pip install flask", w.chat.history.toPlainText())
+        self.assertIn("Successfully installed", prov.everything())
+
+    def test_toggle_off(self):
+        w = self.window()
+        prov = Script(["ок"])
+        w.providers = {"cheap": prov, "strong": prov}
+        w.act_install.setChecked(False)
+        w.toggle_install()
+        w.ask_ai("сделай")
+        self.wait(w)
+        self.assertNotIn("install_packages", prov.systems[0])
+        self.assertFalse(settings.get_user()["install"])
+
+
 class TerminalGuiTest(GuiCase):
     def setUp(self):
         super().setUp()

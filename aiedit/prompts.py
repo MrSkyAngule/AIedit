@@ -90,6 +90,15 @@ Web:
 """
 
 
+# добавляется к AGENT_SYSTEM, когда можно просить установку пакетов
+INSTALL_ADDON = """
+Packages:
+- install_packages: packages - asks the user to install Python packages from PyPI into the project environment, like `flask requests==2.32.3`. Names and versions only.
+- Only prebuilt wheels are installed. Use exact, well-known package names; the user sees and approves the list.
+- Add what you install to the project's requirements file yourself.
+"""
+
+
 def agent_system(base: str, addons: list[str]) -> str:
     """Системный промпт агента с разделами про дополнительные инструменты, которые сейчас доступны."""
     extra = "".join(a.lstrip("\n") for a in addons)

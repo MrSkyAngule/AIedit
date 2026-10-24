@@ -55,6 +55,7 @@ you see it. Nothing is written to disk without your approval.
 | Tool | What it does | Guard |
 |---|---|---|
 | `list_files`, `read_file`, `search` | look at the project | closed paths do not exist, zones are redacted |
+| `go_to_definition`, `find_references` | navigate code | a language server (pylsp, pyright, typescript-language-server, gopls) runs on a copy without closed code; without one, Python is parsed by the editor |
 | `edit_file`, `create_file`, `delete_file`, `rename_file` | propose changes | applied only after review; files with zones can't be deleted or moved |
 | `run_command` | run tests or the program | sandbox, your approval (below) |
 | `fetch_url` | read a documentation page | https only; sites outside your list need approval |
@@ -133,6 +134,8 @@ aiedit path/to/project_or_file
 ```
 
 Choose the binding explicitly with `AIEDIT_QT=pyside6` or `AIEDIT_QT=pyqt6`.
+For better code navigation install a language server, for example `pip install python-lsp-server`
+(Python) or `npm i -g typescript-language-server typescript` (JS/TS). It is optional.
 Connect models in the menu (API keys are stored in `~/.config/aiedit/`, never in the project).
 Without keys the editor runs on an offline demo model.
 

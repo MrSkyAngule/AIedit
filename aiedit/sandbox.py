@@ -347,31 +347,33 @@ def preapproved(command: str, allowed) -> bool:
     return name is not None and name in set(allowed)
 
 
-class Terminal:
-    """Инструмент run_command. approve(команда) -> "run" | "deny" спрашивает человека;
-    show(результат) показывает ему вывод. Копия создаётся при первой команде и живёт до close()."""
+class ProjectCopy:
+    """Копия проекта без закрытого кода (build_copy) с правками агента. Создаётся при первом prepare()
+    и живёт до close(). Ей пользуются терминал и навигация по коду, каждый своей."""
 
-    def __init__(self, ws: Workspace, approve: Callable[[str], str], show: Callable[[checks.CheckResult], None] | None = None,
-                 runner=None, timeout: float = TIMEOUT):
-        self.ws, self.approve, self.show, self.runner, self.timeout = ws, approve, show, runner, timeout
+    def __init__(self, ws: Workspace, prefix: str = "aiedit-sandbox-"):
+        self.ws, self.prefix = ws, prefix
         self.tmp: tempfile.TemporaryDirectory | None = None
         self.synced: dict[Path, str | None] = {}  # что записано в копию; None - удалён
         self.skipped: list[str] = []
-        self.runs = 0
 
     @property
-    def work(self) -> Path:
+    def path(self) -> Path:
         return Path(self.tmp.name)
 
-    def _prepare(self):
+    def prepare(self) -> list[Path]:
+        """Создаёт копию (если её ещё нет) и переносит в неё правки агента. Возвращает изменённые файлы копии."""
         if self.tmp is None:
-            self.tmp = tempfile.TemporaryDirectory(prefix="aiedit-sandbox-")
-            self.skipped = build_copy(self.ws, self.work)
-        for path, st in self.ws.states.items():  # правки агента - в копию
-            target = self.work / path.relative_to(self.ws.root)
+            self.tmp = tempfile.TemporaryDirectory(prefix=self.prefix)
+            self.skipped = build_copy(self.ws, self.path)
+        changed = []
+        for path, st in self.ws.states.items():
+            target = self.path / path.relative_to(self.ws.root)
             if st.deleted:
-                target.unlink(missing_ok=True)
-                self.synced[path] = None
+                if self.synced.get(path, "") is not None:
+                    target.unlink(missing_ok=True)
+                    self.synced[path] = None
+                    changed.append(target)
                 continue
             if st.base is not None and st.text == st.base and path not in self.synced:
                 continue  # не менялся (если правку откатили, копию надо вернуть - тогда он в synced)
@@ -380,6 +382,39 @@ class Terminal:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(text, encoding="utf-8")
                 self.synced[path] = text
+                changed.append(target)
+        return changed
+
+    def close(self):
+        if self.tmp is not None:
+            self.tmp.cleanup()
+            self.tmp = None
+
+
+class Terminal:
+    """Инструмент run_command. approve(команда) -> "run" | "deny" спрашивает человека;
+    show(результат) показывает ему вывод. Копия создаётся при первой команде и живёт до close()."""
+
+    def __init__(self, ws: Workspace, approve: Callable[[str], str], show: Callable[[checks.CheckResult], None] | None = None,
+                 runner=None, timeout: float = TIMEOUT):
+        self.ws, self.approve, self.show, self.runner, self.timeout = ws, approve, show, runner, timeout
+        self.copy = ProjectCopy(ws)
+        self.runs = 0
+
+    @property
+    def tmp(self):
+        return self.copy.tmp
+
+    @property
+    def work(self) -> Path:
+        return self.copy.path
+
+    @property
+    def skipped(self) -> list[str]:
+        return self.copy.skipped
+
+    def _prepare(self):
+        self.copy.prepare()
 
     def __call__(self, command: str) -> str:
         command = (command or "").strip()
@@ -416,6 +451,4 @@ class Terminal:
         return f"$ {res.command}\n{status}\n{output or '(no output)'}{note}"
 
     def close(self):
-        if self.tmp is not None:
-            self.tmp.cleanup()
-            self.tmp = None
+        self.copy.close()

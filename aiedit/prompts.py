@@ -109,6 +109,15 @@ SEARCH_ADDON = """
 """
 
 
+# добавляется к AGENT_SYSTEM, когда доступна навигация по коду
+NAV_ADDON = """
+Code navigation:
+- go_to_definition: path, line, symbol - where the symbol used on that line is defined.
+- find_references: path, line, symbol - where it is used. Prefer these to text search for renames and refactors.
+- line is the line number shown by read_file; symbol must be on that line.
+"""
+
+
 def agent_system(base: str, addons: list[str]) -> str:
     """Системный промпт агента с разделами про дополнительные инструменты, которые сейчас доступны."""
     extra = "".join(a.lstrip("\n") for a in addons)

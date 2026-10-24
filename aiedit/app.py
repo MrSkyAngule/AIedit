@@ -11,7 +11,7 @@ from .gitpanel import GitPanel
 from .qt import (BINDING, QAction, QApplication, QDockWidget, QFileDialog, QKeySequence, QSize, QToolBar,
                  QInputDialog, QMainWindow, QMessageBox, Qt, QTabWidget, QTextCursor, QThread, QTimer, QVBoxLayout, QWidget,
                  Signal)
-from . import (agent, analysis, checkpoints, checks, journal, project_rules, conductor, flows, prompts, dialogs, guard, orchestrator, outbound, policy, related,
+from . import (agent, analysis, checkpoints, checks, codenav, journal, project_rules, conductor, flows, prompts, dialogs, guard, orchestrator, outbound, policy, related,
                packages, sandbox, search, secrets_scan, sendlog, settings, web)
 from . import chatstore
 from .chat import ChatPanel
@@ -73,6 +73,7 @@ class AgentWorker(QThread):
                           if approve_install is not None else None)
         self.extend = extend  # спросить человека, продолжать ли после лимита шагов
         self.searcher = searcher  # search.Search, если есть ключ поиска и интернет включён
+        self.nav = codenav.Navigator(ws)  # только чтение, видит лишь то, что модели и так можно
 
     def ask(self, question: str) -> str | None:
         """Вопрос модели человеку: показываем в окне и ждём ответа. None - остановили, не дождавшись."""
@@ -95,19 +96,21 @@ class AgentWorker(QThread):
                                              on_progress=self.progress.emit, should_stop=lambda: self.cancel,
                                              review_on=self.review_on, analyze_on=self.analyze_on, ask=self.ask,
                                              terminal=self.terminal, web=self.reader, install=self.installer,
-                                             extend=self.ask_extend, search=self.searcher)
+                                             extend=self.ask_extend, search=self.searcher, nav=self.nav)
             else:
                 result = flows.run_agent(task, ws, provider, history, open_file, self.translator,
                                          on_progress=self.progress.emit, should_stop=lambda: self.cancel,
                                          roster=self.roster, review_on=self.review_on, analyze_on=self.analyze_on,
                                          ask=self.ask, terminal=self.terminal, web=self.reader,
-                                         install=self.installer, extend=self.ask_extend, search=self.searcher)
+                                         install=self.installer, extend=self.ask_extend, search=self.searcher,
+                                         nav=self.nav)
             self.done.emit(result)
         except Exception as e:  # доступ закрыли по ходу работы, сеть, формат ответа
             self.failed.emit(f"{type(e).__name__}: {e}")
         finally:
             if self.terminal is not None:
                 self.terminal.close()
+            self.nav.close()
 
 
 class MainWindow(QMainWindow):

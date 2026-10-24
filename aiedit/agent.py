@@ -46,7 +46,9 @@ TOOLS: dict[str, dict] = {
     "create_file": {"path": str, "content": str},
     "delete_file": {"path": str},
     "rename_file": {"path": str, "new_path": str},
-    "update_notes": {"notes": str},  # план агента: редактор хранит его и возвращает после сжатия
+    "update_notes": {"notes": str},
+    "go_to_definition": {"path": str, "line": int, "symbol": str},  # навигация (codenav.Navigator)
+    "find_references": {"path": str, "line": int, "symbol": str},  # план агента: редактор хранит его и возвращает после сжатия
     "ask_user": {"question": str},  # не инструмент рабочей области: отвечает человек
     "run_command": {"command": str},  # выполняет редактор, в песочнице (sandbox.Terminal)
     "fetch_url": {"url": str},  # открывает редактор, только сайты из списка или с одобрения (web.Web)
@@ -163,6 +165,9 @@ def describe_call(call: Call) -> str:
         return f"предлагаю перенести {a.get('path', '?')} → {a.get('new_path', '?')}"
     if call.name == "update_notes":
         return "обновляю план"
+    if call.name in ("go_to_definition", "find_references"):
+        what = "где определено" if call.name == "go_to_definition" else "где используется"
+        return f"{what}: {a.get('symbol', '?')} ({a.get('path', '?')}:{a.get('line', '?')})"
     if call.name == "ask_user":
         return "задаю вопрос"
     if call.name == "run_command":
@@ -239,7 +244,7 @@ def run(task: str, ws: Workspace, provider: Provider, history: list | None = Non
         terminal: Callable[[str], str] | None = None, web: Callable[[str], str] | None = None,
         install: Callable[[str], str] | None = None,
         extend: Callable[[int, int], bool] | None = None,
-        search: Callable[[str], str] | None = None) -> AgentResult:
+        search: Callable[[str], str] | None = None, nav: Callable[[str, dict], str] | None = None) -> AgentResult:
     """Крутит цикл: запрос к модели, выполнение инструментов, ответ редактора, пока не будет итога.
     ask(вопрос) -> ответ человека или None; без ask модель не знает про ask_user и решает сама.
     terminal(команда) -> вывод для модели (sandbox.Terminal); без него run_command нет.
@@ -260,7 +265,7 @@ def run(task: str, ws: Workspace, provider: Provider, history: list | None = Non
     system = prompts.agent_system(system or SYSTEM, [addon for on, addon in (
         (ask is not None, prompts.ASK_ADDON), (terminal is not None, prompts.TERMINAL_ADDON),
         (web is not None, prompts.WEB_ADDON), (search is not None and web is not None, prompts.SEARCH_ADDON),
-        (install is not None, prompts.INSTALL_ADDON)) if on])
+        (install is not None, prompts.INSTALL_ADDON), (nav is not None, prompts.NAV_ADDON)) if on])
     full_system = prompts.with_reply(system, english_reply)
     budget, step = max_steps, 0
     while True:
@@ -301,6 +306,9 @@ def run(task: str, ws: Workspace, provider: Provider, history: list | None = Non
             if call.name == "ask_user":
                 out, used = ask_human(call, ask, asked)
                 asked += used
+            elif call.name in ("go_to_definition", "find_references"):
+                out = (f"ERROR: {call.error}" if call.error else nav(call.name, call.args) if nav is not None
+                       else "ERROR: code navigation is not available here; use search")
             elif call.name == "update_notes":
                 result.plan = call.args.get("notes", "").strip()[:MAX_NOTES]
                 out = "notes saved" if result.plan else "ERROR: missing arguments: notes"

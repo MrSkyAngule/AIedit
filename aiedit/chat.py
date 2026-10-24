@@ -34,8 +34,18 @@ def bubble_html(kind: str, text: str, meta: str = "") -> str:
 
 
 class ChatInput(QPlainTextEdit):
-    """Enter отправляет, Shift+Enter - перенос строки."""
+    """Enter отправляет, Shift+Enter - перенос строки. Вставленная картинка уходит сигналом imagePasted."""
     submitted = Signal()
+    imagePasted = Signal(object)  # QImage
+
+    def canInsertFromMimeData(self, source):
+        return source.hasImage() or super().canInsertFromMimeData(source)
+
+    def insertFromMimeData(self, source):
+        if source.hasImage():
+            self.imagePasted.emit(source.imageData())
+            return
+        super().insertFromMimeData(source)
 
     def keyPressEvent(self, e):
         if (e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
@@ -53,6 +63,7 @@ class ChatPanel(QWidget):
     contextCleared = Signal()
     changed = Signal()
     stopRequested = Signal()
+    attachRequested = Signal()
 
     def __init__(self):
         super().__init__()
@@ -72,6 +83,20 @@ class ChatPanel(QWidget):
         self.input.setPlaceholderText(self.PLACEHOLDER)
         self.input.setFixedHeight(72)
         self.input.submitted.connect(self.submit)
+        self.attached: list[tuple[str, str]] = []  # (метка картинки, имя) - уйдут со следующим сообщением
+        self.attach_btn = QPushButton("Картинка...")
+        self.attach_btn.setToolTip("Приложить картинку к сообщению. Скриншот можно вставить в поле ввода (Ctrl+V)")
+        self.attach_btn.clicked.connect(lambda _=False: self.attachRequested.emit())
+        self.attach_label = QLabel("")
+        self.attach_label.setWordWrap(True)
+        self.attach_clear = QPushButton("Убрать")
+        self.attach_clear.clicked.connect(lambda _=False: self.clear_attachments())
+        self.attach_row = QWidget()
+        att = QHBoxLayout(self.attach_row)
+        att.setContentsMargins(0, 0, 0, 0)
+        att.addWidget(self.attach_label, 1)
+        att.addWidget(self.attach_clear)
+        self.attach_row.hide()
         self.send_btn = QPushButton("Отправить")
         self.send_btn.clicked.connect(self.submit)
         self.explain_btn = QPushButton("Объяснить зелёные зоны")
@@ -102,6 +127,7 @@ class ChatPanel(QWidget):
 
         row = QHBoxLayout()
         row.addWidget(self.explain_btn)
+        row.addWidget(self.attach_btn)
         row.addStretch()
         row.addWidget(self.send_btn)
         lay = QVBoxLayout(self)
@@ -109,12 +135,27 @@ class ChatPanel(QWidget):
         lay.addWidget(self.history, 1)
         lay.addWidget(self.context_row)
         lay.addWidget(self.busy_row)
+        lay.addWidget(self.attach_row)
         lay.addWidget(self.input)
         lay.addLayout(row)
 
     def set_context(self, names: list[str]):
         self.context_row.setVisible(bool(names))
         self.context_label.setText("В контексте (только чтение): " + ", ".join(names))
+
+    def add_attachment(self, mark: str, name: str):
+        self.attached.append((mark, name))
+        self.attach_label.setText("Картинки к сообщению: " + ", ".join(n for _, n in self.attached))
+        self.attach_row.show()
+
+    def clear_attachments(self):
+        self.attached = []
+        self.attach_row.hide()
+
+    def take_attachments(self) -> list[tuple[str, str]]:
+        out = self.attached
+        self.clear_attachments()
+        return out
 
     def add_menu_action(self, action):
         self.menu.addAction(action)

@@ -6,10 +6,10 @@ import threading
 from pathlib import Path
 
 from .searchdialog import SearchDialog
-from .qt import (BINDING, QAction, QApplication, QDockWidget, QFileDialog, QKeySequence,
+from .qt import (BINDING, QAction, QApplication, QBuffer, QByteArray, QDockWidget, QFileDialog, QIODevice, QKeySequence,
                  QInputDialog, QMainWindow, QMessageBox, Qt, QTabWidget, QTextCursor, QThread, QTimer, QVBoxLayout, QWidget,
                  Signal)
-from . import (agent, analysis, checkpoints, checks, journal, conductor, flows, prompts, dialogs, guard, orchestrator, outbound, policy, related,
+from . import (agent, analysis, checkpoints, checks, images, journal, conductor, flows, prompts, dialogs, guard, orchestrator, outbound, policy, related,
                packages, sandbox, secrets_scan, sendlog, settings, web)
 from . import chatstore
 from .chat import ChatPanel
@@ -52,7 +52,7 @@ class AgentWorker(QThread):
 
     def __init__(self, task, ws, provider, history, open_file, translator=None, roster=None,
                  conduct=False, review_on=False, analyze_on=False, approve_command=None, reader=None,
-                 approve_install=None):
+                 approve_install=None, attached=None):
         super().__init__()
         self.args = (task, ws, provider, history, open_file)
         self.translator = translator
@@ -69,6 +69,7 @@ class AgentWorker(QThread):
         self.reader = reader  # web.Web, если человек разрешил ИИ читать страницы документации
         self.installer = (packages.Installer(ws.root, approve_install, self.command_done.emit)
                           if approve_install is not None else None)
+        self.attached = attached or []  # метки картинок, которые приложил человек
 
     def ask(self, question: str) -> str | None:
         """Вопрос модели человеку: показываем в окне и ждём ответа. None - остановили, не дождавшись."""
@@ -87,13 +88,14 @@ class AgentWorker(QThread):
                 result = flows.run_conductor(task, ws, self.roster, provider, history, open_file, self.translator,
                                              on_progress=self.progress.emit, should_stop=lambda: self.cancel,
                                              review_on=self.review_on, analyze_on=self.analyze_on, ask=self.ask,
-                                             terminal=self.terminal, web=self.reader, install=self.installer)
+                                             terminal=self.terminal, web=self.reader, install=self.installer,
+                                             attached=self.attached)
             else:
                 result = flows.run_agent(task, ws, provider, history, open_file, self.translator,
                                          on_progress=self.progress.emit, should_stop=lambda: self.cancel,
                                          roster=self.roster, review_on=self.review_on, analyze_on=self.analyze_on,
                                          ask=self.ask, terminal=self.terminal, web=self.reader,
-                                         install=self.installer)
+                                         install=self.installer, attached=self.attached)
             self.done.emit(result)
         except Exception as e:  # доступ закрыли по ходу работы, сеть, формат ответа
             self.failed.emit(f"{type(e).__name__}: {e}")
@@ -162,6 +164,9 @@ class MainWindow(QMainWindow):
         self.chat.explainRequested.connect(self.explain_ai)
         self.ask_btn, self.explain_btn = self.chat.send_btn, self.chat.explain_btn
         self.chat.clearRequested.connect(self.clear_chat)
+        self.chat.attachRequested.connect(self.attach_image)
+        self.chat.input.imagePasted.connect(self.paste_image)
+        self.pasted = 0
         self.chat_dock = dock = QDockWidget("Чат с ИИ", self)
         dock.setWidget(self.chat)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
@@ -968,6 +973,10 @@ class MainWindow(QMainWindow):
         task = task.strip()
         if not task or self.worker or self.ai_blocked:
             return
+        if self.chat.attached:
+            self.say("картинки работают в режиме проекта: открой папку (Файл → Открыть папку). Картинки остались приложенными")
+            self.chat.input.setPlainText(task)
+            return
         self.chat.add_user(task)
         if not self.may_send():
             self.chat.input.setPlainText(task)  # не теряем набранное
@@ -1448,15 +1457,51 @@ class MainWindow(QMainWindow):
     def make_workspace(self, log: bool = True) -> Workspace:
         return Workspace(self.tree.root, self.live_files(), self.providers["strong"].name, log_enabled=log)
 
+    # --- картинки ---
+    def attach_image(self):
+        name, _ = QFileDialog.getOpenFileName(self, "Картинка для ИИ", str(self.tree.root or Path.home()),
+                                              "Картинки (*.png *.jpg *.jpeg *.gif *.webp)")
+        if name:
+            try:
+                self.add_image(Path(name).read_bytes(), Path(name).name)
+            except OSError as e:
+                self.say(f"картинку не прочитать: {e}")
+
+    def paste_image(self, image):
+        data = QByteArray()
+        buf = QBuffer(data)
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        image.save(buf, "PNG")
+        buf.close()
+        self.pasted += 1
+        self.add_image(bytes(data), f"скриншот {self.pasted}.png")
+
+    def add_image(self, data: bytes, name: str):
+        try:
+            mark = images.register(data, name)
+        except ValueError as e:
+            self.say(f"картинку не приложить: {e}")
+            return
+        self.chat.add_attachment(mark, name)
+        self.say(f"картинка приложена: {name}. Фильтр исходящего не читает картинки: проверь, что на ней нет секретов")
+
     def ask_agent(self, task: str):
         task = task.strip()
         if not task or self.worker:
             return
-        self.chat.add_user(task)
+        attached = self.chat.take_attachments()
+        shown = task + "".join(f"\n[картинка: {n}]" for _, n in attached)
+        self.chat.add_user(shown)
         if not self.may_send(project=True):
             self.chat.input.setPlainText(task)
+            for mark, n in attached:
+                self.chat.add_attachment(mark, n)
             return
-        self.sent_task, self.sent_source = task, self.path
+        self.sent_task, self.sent_source = shown, self.path
+        if attached:  # картинки уходят модели целиком: в журнале отправок - их имена
+            sendlog.record(None, {"mode": "image", "model": self.providers["strong"].name,
+                                  "files": [{"name": n} for _, n in attached], "chars": 0, "messages": 0},
+                           self.tree.root)
         provider = self.conductor_provider if self.conductor_on else self.providers["strong"]
         self.ask_btn.setEnabled(False)
         self.explain_btn.setEnabled(False)
@@ -1467,7 +1512,7 @@ class MainWindow(QMainWindow):
                                   self.active_translator(), self.gate.wrap_roster(self.roster), self.conductor_on,
                                   self.review_active(), self.analyze_on,
                                   self.decide_command if self.terminal_active() else None, self.make_reader(),
-                                  self.decide_install if self.install_on else None)
+                                  self.decide_install if self.install_on else None, [m for m, _ in attached])
         self.worker.progress.connect(self.say)
         self.worker.question.connect(self.on_question)
         self.worker.command_done.connect(self.show_command)

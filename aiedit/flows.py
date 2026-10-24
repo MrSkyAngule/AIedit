@@ -81,7 +81,7 @@ def run_agent(task: str, ws, provider, history: list | None = None, open_file: P
     if res.from_model:
         res.text_en = res.text
         res.text = _answer_to_ru(res.text_en, translator, notes, on_progress)
-    res.notes = notes
+    res.notes = [*res.notes, *notes]
     return res
 
 

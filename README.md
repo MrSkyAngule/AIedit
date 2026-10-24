@@ -48,10 +48,25 @@ def refund(user, amount):
 **Closed folders and files.** Right-click in the file tree. Closed paths look non-existent
 to the model: they are missing from listings, search and reads.
 
-**No shell for the model.** The agent works only through the editor's own tools:
-`list_files`, `read_file`, `search`, `edit_file`, `create_file`. Every result passes the
-zone and path filters; every proposed edit is checked against the zones by a diff before
+**No shell for the model.** The agent works only through the editor's own tools. Every result
+passes the zone and path filters; every proposed edit is checked against the zones by a diff before
 you see it. Nothing is written to disk without your approval.
+
+| Tool | What it does | Guard |
+|---|---|---|
+| `list_files`, `read_file`, `search` | look at the project | closed paths do not exist, zones are redacted |
+| `edit_file`, `create_file`, `delete_file`, `rename_file` | propose changes | applied only after review; files with zones can't be deleted or moved |
+| `run_command` | run tests or the program | sandbox, your approval (below) |
+| `fetch_url` | read a documentation page | https only; sites outside your list need approval |
+| `install_packages` | ask to `pip install` into `.venv` | your approval every time; PyPI names only; prebuilt wheels only, so no package code runs on install |
+| `view_image` | look at an image in the project | only for models that accept images |
+| `ask_user` | ask you when the task is unclear | |
+
+You can also attach a screenshot to a message (button or Ctrl+V in the input box).
+
+**Rollback.** Before applying the agent's edits the editor saves how the files looked. Any applied
+run can be rolled back from the menu, including created and deleted files and the zones. Rollback
+points live in your user profile, not in the project or git.
 
 **Terminal in a sandbox (Linux).** The agent can run commands (`pytest`, the program itself) to
 check its work, but the editor runs them, not the model:
@@ -131,6 +146,9 @@ The suite runs on both PyQt6 and PySide6 and uses fake providers and local HTTP 
   local processes; only the agent's commands go through the sandbox. The sandbox is Linux-only.
 - In the sandbox, code inside closed zones does not run, and lines that look like secrets are
   removed even if the secret is fake. Code that depends on them fails there.
+- Images are sent to the model as they are: the outbound filter cannot read text in pictures.
+- Web pages are untrusted input. The model is told not to follow instructions from them, but that
+  is a request, not a lock. A page cannot reach your files: it only becomes text for the model.
 
 ## Status
 

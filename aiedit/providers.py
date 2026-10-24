@@ -6,9 +6,15 @@ import json
 import re
 import urllib.request
 
+from . import images
+
+# модели OpenAI и совместимые, которые понимают картинки (по имени; у остальных метки уйдут словами)
+_VISION = re.compile(r"^(gpt-4o|chatgpt-4o|gpt-4\.1|gpt-5|o3(?!-mini)|o4)|vision|\dv\b|-vl\b|glm-\d(\.\d)?v", re.I)
+
 
 class Provider:
     name = "base"
+    vision = False  # принимает ли картинки
 
     def complete(self, system: str, messages: list[dict]) -> str:
         raise NotImplementedError
@@ -87,6 +93,8 @@ class AnthropicProvider(Provider):
     коротких задач вроде планирования ставим "low". Параметры sampling не передаём: их новые модели не принимают."""
     URL = "https://api.anthropic.com/v1/messages"
 
+    vision = True
+
     def __init__(self, model: str, api_key: str, effort: str | None = None, max_tokens: int = 8192,
                  url: str | None = None, timeout: float = 120):
         self.name = model
@@ -97,7 +105,17 @@ class AnthropicProvider(Provider):
         self.url = url or self.URL
         self.timeout = timeout
 
+    @staticmethod
+    def content(text: str):
+        """Текст или список блоков, если в тексте есть метки картинок."""
+        if not images.has_images(text):
+            return text
+        return [{"type": "text", "text": v} if k == "text" else
+                {"type": "image", "source": {"type": "base64", "media_type": v[0], "data": v[1]}}
+                for k, v in images.split(text) if k != "text" or v.strip()]
+
     def request_body(self, system: str, messages: list[dict]) -> dict:
+        messages = [{**m, "content": self.content(m["content"])} if m["role"] == "user" else m for m in messages]
         body = {"model": self.model, "max_tokens": self.max_tokens, "system": system, "messages": messages}
         if self.effort:
             body["output_config"] = {"effort": self.effort}
@@ -128,8 +146,19 @@ class OpenAIProvider(Provider):
         self.max_tokens = max_tokens
         self.token_param = token_param  # у старых совместимых серверов это max_tokens
         self.timeout = timeout
+        self.vision = bool(_VISION.search(model))
+
+    def content(self, text: str):
+        if not images.has_images(text):
+            return text
+        if not self.vision:
+            return images.strip(text)
+        return [{"type": "text", "text": v} if k == "text" else
+                {"type": "image_url", "image_url": {"url": f"data:{v[0]};base64,{v[1]}"}}
+                for k, v in images.split(text) if k != "text" or v.strip()]
 
     def request_body(self, system: str, messages: list[dict]) -> dict:
+        messages = [{**m, "content": self.content(m["content"])} if m["role"] == "user" else m for m in messages]
         body = {"model": self.model, "messages": [{"role": "system", "content": system}, *messages]}
         if self.temperature is not None:
             body["temperature"] = self.temperature

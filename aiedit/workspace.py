@@ -10,7 +10,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import guard, policy, secrets_scan, sendlog
+from . import guard, images, policy, secrets_scan, sendlog
 from .guard import Region
 from .marks import Marks, sidecar
 
@@ -266,6 +266,24 @@ class Workspace:
         self.sent.add(real)
         return f"edit accepted: {self.rel(real)}" + (
             f" (needs user confirmation: {', '.join(verdict.needs_confirm_en)})" if verdict.needs_confirm else "")
+
+    def view_image(self, path: str) -> str:
+        """Картинка из проекта для модели: метка, которую провайдер превратит в картинку."""
+        real = self.resolve(path)
+        if real is None or not real.is_file() or policy.is_private_name(real.name):
+            return f"ERROR: file not found: {path}"
+        try:
+            size = real.stat().st_size
+            if size > images.MAX_BYTES:
+                return f"ERROR: {self.rel(real)}: image too large ({size // 1000} KB, at most {images.MAX_BYTES // 1000} KB)"
+            data = real.read_bytes()
+            mark = images.register(data, self.rel(real))
+        except (OSError, ValueError) as e:
+            return f"ERROR: {self.rel(real)}: {e}"
+        out = f"image {self.rel(real)}:\n{mark}"
+        self.sent.add(real)
+        self.log("view_image", out, [(real, None)], chars=len(data))
+        return out
 
     def pending_delete(self, real: Path) -> bool:
         st = self.states.get(real)

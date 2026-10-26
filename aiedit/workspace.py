@@ -128,10 +128,13 @@ class Workspace:
     def view_regions(self, st: FileState) -> list[Region]:
         """Зоны файла плюс скрытые на лету секреты и закрытый код, попавший сюда без своих зон (copies):
         их модель не видит и менять не может."""
-        lines = st.text.split("\n")
-        found = secrets_scan.uncovered(secrets_scan.scan(st.text), st.regions, len(lines))
         stray = copies.regions(copies.find(st.text, st.regions, self.copies, st.allowed))
-        return st.regions + [Region("hidden", a, b) for a, b in secrets_scan.to_ranges(found)] + stray
+        return st.regions + self.secret_regions(st) + stray
+
+    def secret_regions(self, st: FileState) -> list[Region]:
+        """Строки, похожие на секреты, которые не закрыты зонами человека: их редактор прячет сам."""
+        found = secrets_scan.uncovered(secrets_scan.scan(st.text), st.regions, st.text.count("\n") + 1)
+        return [Region("hidden", a, b) for a, b in secrets_scan.to_ranges(found)]
 
     def view(self, st: FileState) -> guard.Redacted:
         return guard.redact(st.text, self.view_regions(st))

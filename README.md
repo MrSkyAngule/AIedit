@@ -98,7 +98,8 @@ check its work, but the editor runs them, not the model:
 - each command needs your approval (simple commands like `pytest` can be allowed once and for all);
 - it runs under bubblewrap on a copy of the project with the agent's proposed edits applied;
 - the copy holds only what the model may see: closed files are absent, `interface` functions keep
-  their signatures but raise `NotImplementedError`, `hidden` code and secret lines are gone;
+  their signatures but raise `NotImplementedError`, `hidden` code is gone, and quoted values that look
+  like secrets become `"<hidden>"` (so `"password": "secret123",` in a test still parses);
 - no network, no home directory, an empty environment (no API keys), a time limit;
 - Linux: bubblewrap. macOS: the built-in `sandbox-exec` with a deny-by-default profile; it is
   covered by tests of the profile only, not run on a real Mac yet. Windows: run the editor in WSL;
@@ -191,8 +192,9 @@ The suite runs on both PyQt6 and PySide6 and uses fake providers and local HTTP 
   or use `hidden` there. Docstrings are not sent.
 - Tests and analyzers the editor runs on its own (post-edit check, static analysis) are ordinary
   local processes; only the agent's commands go through the sandbox. No sandbox on native Windows.
-- In the sandbox, code inside closed zones does not run, and lines that look like secrets are
-  removed even if the secret is fake. Code that depends on them fails there.
+- In the sandbox, code inside closed zones does not run, and values that look like secrets are replaced
+  with `"<hidden>"` even if the secret is fake (a whole line goes if the value is not in quotes). Code that
+  depends on the real value fails there.
 - Web pages are untrusted input. The model is told not to follow instructions from them, but that
   is a request, not a lock. A page cannot reach your files: it only becomes text for the model.
 

@@ -118,6 +118,36 @@ class CopyTest(CopyCase):
         self.assertFalse((dest / "pay.py").exists())
         self.assertEqual(self.skipped, ["pay.py"])
 
+    def test_secret_value_in_a_dict_keeps_the_test_file_valid(self):
+        # живой прогон: «"password": "secret123",» в тесте заменялся на raise внутри словаря, pytest падал с SyntaxError
+        test = ('def test_register(client):\n    resp = client.post("/api/register", json={\n'
+                '        "username": "alice",\n        "password": "secret123",\n    })\n'
+                '    assert resp.status_code == 201\n')
+        (self.root / "test_app.py").write_text(test)
+        text = (self.copy() / "test_app.py").read_text()
+        compile(text, "test_app.py", "exec")
+        self.assertNotIn("secret123", text)
+        self.assertIn('"password": "<hidden>",', text)
+        self.assertEqual(text.count("\n"), test.count("\n"))
+
+    def test_unquoted_secret_value_hides_the_whole_line(self):
+        (self.root / "cfg.py").write_text("x = 1\nDB_PASSWORD = build_secret_from(seed)\ny = 2\n")
+        text = (self.copy() / "cfg.py").read_text()
+        self.assertNotIn("build_secret_from", text)
+        self.assertEqual(text, "x = 1\npass\ny = 2\n")
+
+    def test_masked_values_are_named_in_the_notice(self):
+        (self.root / "conf.py").write_text('token = "abcdef123456"\n')
+        closed: dict = {}
+        sandbox.build_copy(self.ws, Path(self.tmp.name), closed)
+        self.assertIn('1 line(s) had secret-looking values replaced with "<hidden>"', sandbox.closed_notice(closed))
+
+    def test_mask_secret_values(self):
+        self.assertEqual(sandbox.mask_secret_values('KEY = "sk-ant-api03-AbCdEf0123456789xyz"'), 'KEY = "<hidden>"')
+        self.assertEqual(sandbox.mask_secret_values("login(user, password='hunter22')"), "login(user, password='<hidden>')")
+        self.assertIsNone(sandbox.mask_secret_values("API_TOKEN=abcdef123456"))  # без кавычек
+        self.assertIsNone(sandbox.mask_secret_values("x = 1"))
+
     def test_non_python_closed_lines_become_empty(self):
         (self.root / "cfg.txt").write_text("a\nsecret line\nb\n")
         m = Marks()

@@ -25,7 +25,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Callable
 
-from . import checks, guard, policy
+from . import checks, guard, policy, secrets_scan
 from .workspace import SKIP_DIRS, FileState, Workspace
 
 TIMEOUT = 60
@@ -100,6 +100,26 @@ def blank_python(code: str) -> list[str]:
     return [indent + ("pass" if all(isinstance(n, _DEFINITIONS) for n in tree.body) else STUB)]
 
 
+SECRET_VALUE = "<hidden>"  # такое значение secrets_scan считает заглушкой: вывод с ним не вычищается
+
+
+def mask_secret_values(line: str) -> str | None:
+    """Строка, где каждое похожее на секрет значение в кавычках заменено на SECRET_VALUE. Так строка
+    `"password": "secret123",` внутри словаря остаётся правильным Python, а raise на её месте ломал бы файл.
+    None, если хоть одно значение не в кавычках (или его не найти): тогда строка прячется целиком."""
+    spans = secrets_scan.spans(line)
+    if not spans:
+        return None
+    out, pos = [], 0
+    for a, b, _ in spans:
+        quote = line[a - 1] if a > 0 else ""
+        if a < pos or quote not in ("'", '"') or b >= len(line) or line[b] != quote:
+            return None
+        out += [line[pos:a], SECRET_VALUE]
+        pos = b
+    return "".join(out) + line[pos:]
+
+
 _DEF_NAME = re.compile(r"^\s*(?:async\s+def|def|class)\s+(\w+)|^(\w+) = \.\.\.")
 
 
@@ -125,6 +145,8 @@ def closed_notice(closed: dict) -> str:
                          + " (real values are not available: variables are None, functions raise NotImplementedError)")
         if e["hidden"]:
             parts.append(f"{e['hidden']} hidden line(s) are gone")
+        if e.get("masked"):
+            parts.append(f'{e["masked"]} line(s) had secret-looking values replaced with "{SECRET_VALUE}"')
         if parts:
             rows.append(f"- {name}: " + "; ".join(parts))
     if not rows:
@@ -139,13 +161,21 @@ def sandbox_text(ws: Workspace, st: FileState, closed: dict | None = None) -> st
     """Текст файла для копии: закрытые зоны и секреты заменены. Число строк по возможности то же,
     чтобы номера строк в ошибках совпадали с тем, что видит модель.
     closed (если дан) пополняется: что именно в этом файле закрыто (для подсказки модели)."""
-    regions = sorted((r for r in ws.view_regions(st) if r.level in guard.CONCEALED), key=lambda r: r.start)
-    entry = {"names": [], "hidden": 0}
+    lines = st.text.split("\n")
+    entry = {"names": [], "hidden": 0, "masked": 0}
+    masked: set[guard.Region] = set()  # найденные секреты, где хватило заменить само значение
+    for r in ws.secret_regions(st):
+        new = [mask_secret_values(line) for line in lines[r.start:r.end + 1]]
+        if all(n is not None for n in new):
+            lines[r.start:r.end + 1] = new
+            masked.add(r)
+            entry["masked"] += len(new)
+    regions = sorted((r for r in ws.view_regions(st) if r.level in guard.CONCEALED and r not in masked),
+                     key=lambda r: r.start)
     if closed is not None:
         closed.pop(ws.rel(st.path), None)  # файл могли пересобрать: считаем заново, а не добавляем
-    if not regions:
+    if not regions and not masked:
         return st.text
-    lines = st.text.split("\n")
     python = st.path.suffix in PY_SUFFIXES
     out, pos = [], 0
     for r in regions:
@@ -163,7 +193,7 @@ def sandbox_text(ws: Workspace, st: FileState, closed: dict | None = None) -> st
             entry["hidden"] += size
         out += stub + [""] * max(0, size - len(stub))
         pos = r.end + 1
-    if closed is not None and (entry["names"] or entry["hidden"]):
+    if closed is not None and (entry["names"] or entry["hidden"] or entry["masked"]):
         closed[ws.rel(st.path)] = entry
     return "\n".join(out + lines[pos:])
 

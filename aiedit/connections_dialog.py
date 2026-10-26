@@ -116,10 +116,12 @@ class ConnectionsDialog(QDialog):
     def on_row_changed(self, n: int):
         spec = catalog.by_key(self.combos[n].currentData() or "")
         needs_extra = self.combos[n].currentData() == catalog.CUSTOM or (spec is not None and spec.service == "compatible")
-        self.extras[n].setVisible(needs_extra)
+        gateway = spec is not None and spec.service in ("anthropic", "openai")  # адрес шлюза - по желанию
+        self.extras[n].setVisible(needs_extra or gateway)
+        self.extras[n].setPlaceholderText(catalog.GATEWAY_HINT if gateway else catalog.EXTRA_HINT)
         if spec is not None and spec.default_extra:  # адрес по умолчанию подставляем, человек может поправить
             self.extras[n].setText(spec.default_extra)
-        elif not needs_extra:
+        else:
             self.extras[n].setText("")
         self.status[n].setText("")
         self.refresh_roles()

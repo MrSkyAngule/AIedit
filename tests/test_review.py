@@ -151,13 +151,68 @@ class CycleTest(Case):
         self.assertEqual(rep.remaining[0].severity, "low")
         self.assertEqual(self.p["sonnet"].seen, [])
 
-    def test_two_fix_rounds_at_most(self):
-        roster = self.roster(reviewer=[HIGH] * 5,
-                             sonnet=[edit("server.py", "# v1", "# v2"), "ok", edit("server.py", "# v2", "# v3"), "ok", "never"])
+    def test_same_findings_again_stop_the_loop_with_a_reason(self):
+        roster = self.roster(reviewer=[HIGH] * 5, sonnet=[edit("server.py", "# v1", "# v2"), "ok", "never"])
         rep = self.cycle(roster)
-        self.assertEqual(len(rep.rounds), 3)  # проверка, исправление, проверка, исправление, проверка
-        self.assertEqual(len(self.p["glm"].seen), 3)
+        self.assertEqual(len(rep.rounds), 2)  # проверка, исправление, проверка: то же замечание, дальше незачем
+        self.assertEqual(len(self.p["glm"].seen), 2)
+        self.assertIn("повторились", rep.stalled)
         self.assertEqual(len(rep.remaining), 1)
+
+    def test_loop_goes_on_until_clean_but_not_past_the_cap(self):
+        varied = [HIGH.replace("SQL built by string concatenation", f"problem number {i}") for i in range(10)]
+        fixes = []
+        for i in range(1, 8):
+            fixes += [edit("server.py", f"# v{i}", f"# v{i + 1}"), "ok"]
+        roster = self.roster(reviewer=varied, sonnet=fixes)
+        rep = self.cycle(roster)
+        self.assertEqual(len(rep.rounds), 6)  # проверка и пять кругов исправления
+        self.assertEqual(len(self.p["glm"].seen), 6)
+        self.assertIn("предел кругов", rep.stalled)
+
+    def test_loop_ends_as_soon_as_review_is_clean_after_several_rounds(self):
+        varied = [HIGH.replace("SQL built by string concatenation", f"problem number {i}") for i in range(3)]
+        roster = self.roster(reviewer=varied + [CLEAN],
+                             sonnet=[edit("server.py", "# v1", "# v2"), "ok", edit("server.py", "# v2", "# v3"), "ok",
+                                     edit("server.py", "# v3", "# v4"), "ok"])
+        rep = self.cycle(roster)
+        self.assertEqual([len(r.findings) for r in rep.rounds], [1, 1, 1, 0])
+        self.assertEqual((rep.fixed_rounds, rep.stalled, rep.remaining), (3, "", []))
+
+    def test_author_may_also_edit_other_files_this_task_changed(self):
+        self.ws.create_file("page.html", "<form action='/login_old'>\n")  # эта же задача создала шаблон
+        roster = self.roster(reviewer=[HIGH, CLEAN], sonnet=[edit("page.html", "/login_old", "/login"), "synced"])
+        self.cycle(roster)
+        page = next(c for c in self.ws.changes() if c.path.name == "page.html")
+        self.assertIn("/login'", page.new)  # замечание про server.py, а правка согласована в шаблоне
+
+    def test_files_this_task_did_not_touch_stay_closed_to_the_author(self):
+        roster = self.roster(reviewer=[HIGH, CLEAN], sonnet=[edit("pay.py", "KEY", "KEY2"), "gave up"])
+        self.cycle(roster)
+        self.assertNotIn("KEY2", "".join(c.new for c in self.ws.changes()))
+
+    def test_author_who_did_not_run_anything_is_asked_to_check_when_a_terminal_exists(self):
+        ran = []
+        roster = self.roster(reviewer=[HIGH, CLEAN],
+                             sonnet=[edit("server.py", "# v1", "# v2"), "fixed",
+                                     "@@tool run_command\ncommand: pytest\n@@end", "tests pass"])
+        self.cycle(roster, terminal=lambda c: ran.append(c) or "$ pytest\nexit code 0\nok")
+        self.assertEqual(ran, ["pytest"])
+        self.assertIn("did not run anything", self.p["sonnet"].seen[2][1][0]["content"])
+
+    def test_no_extra_request_when_the_author_ran_the_tests_himself(self):
+        ran = []
+        roster = self.roster(reviewer=[HIGH, CLEAN],
+                             sonnet=[edit("server.py", "# v1", "# v2") + "\n@@tool run_command\ncommand: pytest\n@@end",
+                                     "fixed and checked"])
+        self.cycle(roster, terminal=lambda c: ran.append(c) or "$ pytest\nexit code 0\nok")
+        self.assertEqual(ran, ["pytest"])
+        self.assertEqual(len(self.p["sonnet"].seen), 2)  # исправление и итог, без отдельной просьбы проверить
+
+    def test_without_a_terminal_nobody_is_asked_to_run_anything(self):
+        roster = self.roster(reviewer=[HIGH, CLEAN], sonnet=[edit("server.py", "# v1", "# v2"), "fixed"])
+        self.cycle(roster)
+        self.assertEqual(len(self.p["sonnet"].seen), 2)
 
     def test_author_who_changes_nothing_ends_the_dispute(self):
         roster = self.roster(reviewer=[HIGH, HIGH], sonnet=["This is a false positive: the query is built from a constant."])
@@ -230,3 +285,19 @@ class CycleTest(Case):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FullTaskTest(Case):
+    LONG = "Make an API. " + "x" * 700 + " Requirement at the end: the header must be Authorization: Bearer."
+
+    def test_reviewer_and_author_see_the_whole_task_not_its_first_600_characters(self):
+        roster = self.roster(reviewer=[HIGH, CLEAN], sonnet=[edit("server.py", "# v1", "# v2"), "ok"])
+        run_cycle(self.LONG, self.ws, roster, lambda path: roster.get("sonnet"))
+        self.assertIn("Authorization: Bearer", self.p["glm"].seen[0][1][0]["content"])
+        self.assertIn("Authorization: Bearer", self.p["sonnet"].seen[0][1][0]["content"])
+
+    def test_reviewer_is_told_to_check_explicit_requirements_and_not_to_call_deviations_low(self):
+        from aiedit.review import REVIEW_SYSTEM
+        self.assertIn("EXPLICIT requirements", REVIEW_SYSTEM)
+        self.assertIn("at least medium", REVIEW_SYSTEM)
+        self.assertIn("missing access check is high", REVIEW_SYSTEM)

@@ -18,8 +18,7 @@ class FolderDialog(QDialog):
         self.path_edit = QLineEdit()
         self.path_edit.returnPressed.connect(lambda: self.go(Path(self.path_edit.text()).expanduser()))
         self.listing = QListWidget()
-        self.listing.itemActivated.connect(self.enter)
-        self.listing.itemDoubleClicked.connect(self.enter)
+        self.listing.itemActivated.connect(self.enter)  # срабатывает и на двойной клик, и на Enter
         self.hidden = QCheckBox("скрытые папки")
         self.hidden.toggled.connect(lambda _: self.refresh())
         self.note = QLabel()
@@ -72,6 +71,8 @@ class FolderDialog(QDialog):
                 self.listing.addItem(QListWidgetItem(name))
 
     def enter(self, item):
+        if item is None:  # список уже перерисован предыдущим переходом
+            return
         name = item.text()
         self.go(self.current.parent if name == UP else self.current / name)
 

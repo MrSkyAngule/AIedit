@@ -59,6 +59,10 @@ class Roster:
         found = next((w for w in self.workers.values() if w.is_reviewer), None)
         return found if found is not None and any(not w.is_reviewer for w in self.workers.values()) else None
 
+    def can_split(self) -> bool:
+        """Есть ли между кем делить шаги. С одним исполнителем дирижёр только тратит запрос."""
+        return len(self.builders()) > 1
+
     def keys(self) -> list[str]:
         return list(self.workers)
 

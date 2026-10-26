@@ -7,7 +7,7 @@
 from pathlib import Path
 from typing import Callable
 
-from . import agent, analysis, conductor, orchestrator, review as security
+from . import agent, conductor, orchestrator, pipeline
 from .translator import Translator
 
 _BENIGN = ("перевод не нужен", "переводить нечего")
@@ -57,7 +57,8 @@ def _asker(ask, tr: Translator | None, notes: list[str]):
 def run_agent(task: str, ws, provider, history: list | None = None, open_file: Path | None = None,
               translator: Translator | None = None, on_progress: Callable[[str], None] | None = None,
               should_stop: Callable[[], bool] | None = None, roster=None, review_on: bool = False,
-              author=None, analyze_on: bool = False, ask=None, **helpers) -> agent.AgentResult:
+              author=None, analyze_on: bool = False, ask=None, verify_command: str = "", verify_on: bool = True,
+              **helpers) -> agent.AgentResult:
     """Один агент. Если дан реестр с проверяющим и review_on, правки после работы проверяются, а замечания
     возвращаются автору (author - его исполнитель, по умолчанию та модель, что писала код).
     ask(вопрос) -> ответ человека или None: если дан, агент может переспросить, когда задача неоднозначна.
@@ -68,13 +69,11 @@ def run_agent(task: str, ws, provider, history: list | None = None, open_file: P
                     english_reply=translator is not None, ask=_asker(ask, translator, notes), **helpers)
     from .roster import Worker
     who = author or Worker("agent", provider, "", 0, 0, "mid")  # автор правок - та модель, что реально писала код
-    if analyze_on and not res.stopped and ws.changes():
-        res.analysis = analysis.run_cycle(en_task, ws, lambda p: who, on_progress, should_stop,
-                                          english_reply=translator is not None)
-        res.changes = ws.changes()
-    if review_on and roster is not None and roster.reviewer() is not None and not res.stopped and ws.changes():
-        res.review = security.run_cycle(en_task, ws, roster, lambda p: who, on_progress, should_stop,
-                                        english_reply=translator is not None)
+    if not res.stopped and ws.changes():  # тесты до зелёного -> GLM -> тесты -> статанализ (см. pipeline)
+        res.analysis, res.review, res.verification = pipeline.run(
+            en_task, ws, roster, lambda p: who, on_progress, should_stop, english_reply=translator is not None,
+            review_on=review_on, analyze_on=analyze_on, terminal=helpers.get("terminal"),
+            verify_command=verify_command, verify_on=verify_on, helpers=pipeline.fix_helpers(helpers))
         res.changes = ws.changes()
     res.authors = {ws.rel(c.path): provider.name for c in ws.changes()}
     res.task_en = en_task if en_task != task else ""

@@ -2,17 +2,113 @@
 
 messages - список {"role": "user"|"assistant", "content": str}, последняя реплика от user.
 """
+import http.client
 import json
 import re
+import socket
+import time
+import urllib.error
 import urllib.request
+from typing import Callable
+
+RETRY_STATUS = (408, 425, 429, 500, 502, 503, 504, 529)  # временные ошибки сервера и перегрузка: повторяем
+RETRY_DELAYS = (2.0, 6.0)  # пауза перед второй и третьей попыткой
+PROGRESS_EVERY = 0.3       # как часто сообщать, сколько текста уже пришло (секунды)
+WORKER_TIMEOUT = 300       # ожидание тишины на соединении: при потоковой выдаче это пауза между кусками, а не весь ответ
+
+
+def _retry_after(err: urllib.error.HTTPError) -> float | None:
+    try:
+        return min(float(err.headers.get("Retry-After", "")), 30.0)
+    except (TypeError, ValueError):
+        return None
+
+
+_KEYLIKE = re.compile(r"\b(?:sk|pk|rk|key|token)[-_][A-Za-z0-9_\-]{6,}", re.I)
+
+
+def _error_detail(err: urllib.error.HTTPError, secret: str = "") -> str:
+    """Что сервис написал об ошибке (без ключа): «закончился лимит», «модель не найдена» и т. п."""
+    try:
+        raw = err.read(600).decode("utf-8", "replace")
+    except Exception:
+        return ""
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        data = None
+    if isinstance(data, dict):
+        err = data.get("error")
+        message = err.get("message") if isinstance(err, dict) else err  # у одних сервисов error - объект, у других строка
+        raw = str(message or data.get("message") or raw)
+    text = " ".join(raw.split())
+    if len(secret) >= 8:  # у короткого «ключа» замена испортила бы обычный текст; настоящие ключи длинные
+        text = text.replace(secret, "[key]")  # сервис иногда повторяет ключ в тексте ошибки
+    return _KEYLIKE.sub("[key]", text)[:220]
+
+
+def sse_events(resp):
+    """События потоковой выдачи (Server-Sent Events): по одному JSON в строке `data:`. [DONE] - конец."""
+    for raw in resp:
+        line = raw.decode("utf-8", "replace").strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if payload == "[DONE]":
+            return
+        try:
+            yield json.loads(payload)
+        except ValueError:
+            continue
 
 
 class Provider:
     name = "base"
     last_usage: dict | None = None  # расход последнего запроса: input, cache_read, cache_write, output (токены)
+    progress: Callable[[int], None] | None = None  # по ходу выдачи: сколько символов ответа уже пришло
+    retries = len(RETRY_DELAYS)
+    sleep = staticmethod(time.sleep)
+    stream = True
+    timeout: float = WORKER_TIMEOUT
 
     def complete(self, system: str, messages: list[dict]) -> str:
         raise NotImplementedError
+
+    def set_progress(self, callback: Callable[[int], None] | None):
+        self.progress = callback
+
+    def _notify(self, chars: int, state: list[float], force: bool = False):
+        """Не чаще раза в PROGRESS_EVERY секунд: окну хватает, а поток не засоряется."""
+        now = time.monotonic()
+        if self.progress is not None and (force or now - state[0] >= PROGRESS_EVERY):
+            state[0] = now
+            self.progress(chars)
+
+    def _request(self, make_request: Callable[[], urllib.request.Request], read: Callable):
+        """Запрос и чтение ответа с повторами. Временный сбой сети (DNS, обрыв, тишина на соединении) или
+        перегрузка сервера не должны убивать длинную задачу. Неверный ключ и подобное не повторяем.
+        Если сервер не принял потоковый режим (400/422), один раз повторяем без него и запоминаем."""
+        attempt, fell_back = 0, False
+        while True:
+            try:
+                with urllib.request.urlopen(make_request(), timeout=self.timeout) as resp:
+                    return read(resp)
+            except urllib.error.HTTPError as e:
+                code, delay, detail = e.code, _retry_after(e), _error_detail(e, getattr(self, "api_key", "") or "")
+                e.close()
+                if code in (400, 422) and self.stream and not fell_back:
+                    self.stream, fell_back = False, True
+                    continue
+                if code not in RETRY_STATUS or attempt >= self.retries:
+                    # тот же тип и код, но с причиной от сервиса: «403 Forbidden» сам по себе ничего не объясняет
+                    raise urllib.error.HTTPError(e.url, code, f"{e.reason}: {detail}" if detail else e.reason,
+                                                 e.headers, None) from None
+            except (TimeoutError, socket.timeout, urllib.error.URLError, ConnectionError, http.client.HTTPException):
+                if attempt >= self.retries:
+                    raise
+                delay = None
+            self.sleep(delay or RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)])
+            attempt += 1
 
 
 class DemoProvider(Provider):
@@ -93,7 +189,8 @@ class AnthropicProvider(Provider):
     URL = "https://api.anthropic.com/v1/messages"
 
     def __init__(self, model: str, api_key: str, effort: str | None = None, max_tokens: int = 8192,
-                 url: str | None = None, timeout: float = 120, cache: bool = True):
+                 url: str | None = None, timeout: float = WORKER_TIMEOUT, cache: bool = True, stream: bool = True):
+        self.stream = stream
         self.cache = cache
         self.name = model
         self.model = model
@@ -119,14 +216,40 @@ class AnthropicProvider(Provider):
                 "cache_write": u.get("cache_creation_input_tokens") or 0, "output": u.get("output_tokens", 0)}
 
     def complete(self, system: str, messages: list[dict]) -> str:
-        req = urllib.request.Request(
-            self.url, data=json.dumps(self.request_body(system, messages)).encode(),
-            headers={"x-api-key": self.api_key, "anthropic-version": "2023-06-01",
-                     "content-type": "application/json"})
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+        def make() -> urllib.request.Request:
+            body = self.request_body(system, messages)
+            if self.stream:
+                body["stream"] = True
+            return urllib.request.Request(
+                self.url, data=json.dumps(body).encode(),
+                headers={"x-api-key": self.api_key, "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"})
+        return self._request(make, self._read)
+
+    def _read(self, resp) -> str:
+        if resp.headers.get_content_type() != "text/event-stream":  # сервер ответил обычным JSON
             data = json.load(resp)
-        self.last_usage = self.usage(data)
-        return "".join(p.get("text", "") for p in data["content"] if p.get("type", "text") == "text")
+            self.last_usage = self.usage(data)
+            return "".join(p.get("text", "") for p in data["content"] if p.get("type", "text") == "text")
+        parts: list[str] = []
+        chars, state = 0, [0.0]
+        usage = {"input": 0, "cache_read": 0, "cache_write": 0, "output": 0}
+        for event in sse_events(resp):
+            kind = event.get("type")
+            if kind == "message_start":
+                usage.update(self.usage(event.get("message") or {}))
+            elif kind == "content_block_delta" and (event.get("delta") or {}).get("type") == "text_delta":
+                text = event["delta"].get("text", "")
+                parts.append(text)
+                chars += len(text)
+                self._notify(chars, state)
+            elif kind == "message_delta":
+                usage["output"] = (event.get("usage") or {}).get("output_tokens", usage["output"])
+            elif kind == "error":
+                raise RuntimeError("API error: " + str((event.get("error") or {}).get("message", event))[:300])
+        self._notify(chars, state, force=True)
+        self.last_usage = usage
+        return "".join(parts)
 
 
 class OpenAIProvider(Provider):
@@ -135,7 +258,9 @@ class OpenAIProvider(Provider):
     URL = "https://api.openai.com/v1/chat/completions"
 
     def __init__(self, model: str, api_key: str = "", url: str | None = None, temperature: float | None = None,
-                 max_tokens: int | None = None, token_param: str = "max_completion_tokens", timeout: float = 120):
+                 max_tokens: int | None = None, token_param: str = "max_completion_tokens",
+                 timeout: float = WORKER_TIMEOUT, stream: bool = True):
+        self.stream = stream
         self.name = model
         self.model = model
         self.api_key = api_key
@@ -157,12 +282,36 @@ class OpenAIProvider(Provider):
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        req = urllib.request.Request(self.url, data=json.dumps(self.request_body(system, messages)).encode(),
-                                     headers=headers)
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+
+        def make() -> urllib.request.Request:
+            body = self.request_body(system, messages)
+            if self.stream:
+                body["stream"] = True
+                body["stream_options"] = {"include_usage": True}
+            return urllib.request.Request(self.url, data=json.dumps(body).encode(), headers=headers)
+        return self._request(make, self._read)
+
+    def _read(self, resp) -> str:
+        if resp.headers.get_content_type() != "text/event-stream":  # сервер ответил обычным JSON
             data = json.load(resp)
-        self.last_usage = self.usage(data)
-        return data["choices"][0]["message"].get("content") or ""
+            self.last_usage = self.usage(data)
+            return data["choices"][0]["message"].get("content") or ""
+        parts: list[str] = []
+        chars, state, usage = 0, [0.0], None
+        for event in sse_events(resp):
+            if event.get("error"):
+                raise RuntimeError("API error: " + str((event["error"] or {}).get("message", event["error"]))[:300])
+            if event.get("usage"):
+                usage = event
+            for choice in event.get("choices") or []:
+                text = (choice.get("delta") or {}).get("content") or ""
+                if text:
+                    parts.append(text)
+                    chars += len(text)
+                    self._notify(chars, state)
+        self._notify(chars, state, force=True)
+        self.last_usage = self.usage(usage or {})
+        return "".join(parts)
 
     @staticmethod
     def usage(data: dict) -> dict:

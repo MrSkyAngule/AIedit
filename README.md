@@ -31,10 +31,15 @@ aiedit keeps the project whole and closes exactly what matters, down to single l
 | Level | What the model gets |
 |---|---|
 | `hidden` | only a placeholder: something is here, N lines |
-| `interface` | function signatures only, not the body (Python) |
+| `interface` | names, signatures and `#` comments, not the bodies or values (Python) |
 | `readonly` | full code, but any edit to it is rejected |
 | `confirm` | full code, edits need your review |
 | `explain` | the model explains this code |
+
+**Marks for yourself.** A separate kind of mark (Ctrl+6, or the gutter menu) is only for the human: a
+teal strip in the gutter and a note you see on hover. It is stored next to the file in `*.aimarks.json`,
+moves with the lines, survives AI edits and rollback, and is never part of anything sent to a model: it
+lives in a list the request code does not read, and the file that holds it is closed to the agent.
 
 Zones can carry a note ("returns the fee in cents") so the model knows how to use closed
 code without seeing it.
@@ -97,7 +102,9 @@ check its work, but the editor runs them, not the model:
 - no network, no home directory, an empty environment (no API keys), a time limit;
 - Linux: bubblewrap. macOS: the built-in `sandbox-exec` with a deny-by-default profile; it is
   covered by tests of the profile only, not run on a real Mac yet. Windows: run the editor in WSL;
-- whatever the command changes stays in the copy and is thrown away.
+- whatever the command changes stays in the copy and is thrown away;
+- the project's `.venv` is mounted read-only for libraries, but copies of the project's own code installed there
+  (a plain `pip install .`) are hidden, so closed code cannot be read from `site-packages`.
 
 So even a command that prints every file in base64 cannot leak closed code: it is not there.
 
@@ -126,10 +133,19 @@ how many characters left the machine (the content itself is not logged).
 2. **Conductor**: splits a complex task into steps and routes them to programmers.
 3. **Programmers**: write code through the tools above.
 4. **Reviewer** (a model from a different vendor): reads the changes, looks for bugs and
-   vulnerabilities, sends findings back to the author. Read-only, at most 2 rounds.
+   vulnerabilities, sends findings back to the author. Read-only.
 
-Static analyzers (ruff, mypy, bandit, eslint, tsc) run on a temporary copy; only new issues
-are sent back for fixing. After the work, a change journal opens with the largest changes
+The way code reaches you: the author writes, then **the editor itself runs the tests in the sandbox**. If they fail,
+the output goes back to the author, who fixes it, and the tests run again until they are green (at most 6 rounds; the same
+failure twice in a row stops the loop). Only then the next step: author (Claude) -> reviewer (GLM) -> the author fixes **and checks his own work**
+(re-reads the diff, runs the tests in the sandbox) -> reviewer again, until there are no findings (at most
+5 rounds; it stops earlier if the same finding comes back or the author changes nothing, and says why). Then
+static analysis runs, its findings also go back to the author, and if it changed the code the reviewer looks
+once more. Tests run again whenever the reviewer or the analyzers made the author change the code. Only then are the changes shown
+to you, together with the plain result of the last test run (green or red), not the model's own claim.
+
+Static analyzers (ruff, mypy, bandit, eslint, tsc) run on a temporary copy after the review; only new issues
+are sent back to the author for fixing. After the work, a change journal opens with the largest changes
 first.
 
 Providers are plain HTTPS clients (Anthropic, OpenAI and OpenAI-compatible servers), no SDKs.
@@ -165,6 +181,12 @@ The suite runs on both PyQt6 and PySide6 and uses fake providers and local HTTP 
 - Everything that is not closed is sent to the provider you chose; what they do with it
   is governed by their terms.
 - `interface` works for Python only; other languages fall back to `hidden`.
+- Zones live next to the file, in `*.aimarks.json`. If a file is renamed or copied outside the editor, the editor
+  recognizes its closed code by fingerprints (hashes of the closed lines) and keeps it hidden until you decide.
+  It matches the closed part line by line: if that part was changed in the copy, it is not recognized.
+- `interface` sends the `#` comments of the zone to the model, on purpose, so it knows what the closed names mean.
+  A comment can reveal as much as the code: keep secrets and client details out of comments in such zones,
+  or use `hidden` there. Docstrings are not sent.
 - Tests and analyzers the editor runs on its own (post-edit check, static analysis) are ordinary
   local processes; only the agent's commands go through the sandbox. No sandbox on native Windows.
 - In the sandbox, code inside closed zones does not run, and lines that look like secrets are
@@ -174,8 +196,9 @@ The suite runs on both PyQt6 and PySide6 and uses fake providers and local HTTP 
 
 ## Status
 
-Early version. All tests pass on offline and fake providers; it has not yet been
-verified end-to-end against real model APIs.
+Early version. Tried end-to-end against real model APIs: Claude Opus 5.5 as the programmer and GLM 5.3 as
+the reviewer, and local qwen2.5-coder models. On code quality it still trails Claude Code running the same
+model. The test suite runs on offline and fake providers.
 
 ## License
 

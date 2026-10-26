@@ -198,6 +198,8 @@ class AnalysisReport:
     notes: list[str] = field(default_factory=list)   # что не нашлось или не запустилось (для человека)
     skipped: str = ""
     stopped: str = ""
+    stalled: str = ""  # почему цикл остановился, не добившись чистого анализа (то же замечание повторилось, лимит)
+    fixes: int = 0     # сколько раз автор реально изменил код по замечаниям
 
     @property
     def remaining(self) -> list[Issue]:
@@ -205,7 +207,7 @@ class AnalysisReport:
 
     @property
     def fixed_rounds(self) -> int:
-        return max(len(self.rounds) - 1, 0)
+        return self.fixes
 
 
 def _rels(ws: Workspace, analyzers: list[Analyzer]) -> tuple[list, list[str], list[str]]:
@@ -283,34 +285,41 @@ def _concealed_text(ws: Workspace, st) -> list[str]:
     return [l for l, r in zip(lines, lr) if r is not None and r.level in guard.CONCEALED]
 
 
+MAX_ROUNDS = 5
+
 FIX_PROMPT = """Static analysis found NEW problems introduced by your changes. Fix them with the smallest correct \
-edits. Edit only the listed files. Do not hide a warning with noqa or ignore comments unless the warning is wrong, \
-and then say so in your final answer.
+edits. You may edit the listed files and the other files this task already created or changed. Do not hide a \
+warning with noqa or ignore comments unless the warning is wrong, and then say so in your final answer.
+When you are done, check your own work: if the sandbox terminal is available, run the project's tests or the \
+program and make sure your fixes did not break anything. Say plainly what you ran and what you could not verify.
 Original task: {task}
 Problems:
 {issues}"""
 
 
-def _fix(task: str, ws: Workspace, author, issues: list[Issue], on_progress, should_stop, english_reply: bool) -> str:
-    scope = {p for i in issues if (p := ws.resolve(i.file)) is not None}
-    prompt = FIX_PROMPT.format(task=task[:600], issues="\n".join(i.text() for i in issues))
+def _fix(task: str, ws: Workspace, author, issues: list[Issue], on_progress, should_stop, english_reply: bool,
+         terminal=None) -> str:
+    scope = {p for i in issues if (p := ws.resolve(i.file)) is not None} | {c.path for c in ws.changes()}
+    prompt = FIX_PROMPT.format(task=task[:6000], issues="\n".join(i.text() for i in issues))
     ws.edit_scope, saved = scope, ws.model
     ws.model = author.provider.name
     try:
         res = agent.run(prompt, ws, author.provider, None, None, on_progress, should_stop,
-                        english_reply=english_reply, max_steps=15)
+                        english_reply=english_reply, max_steps=25, terminal=terminal)
     finally:
         ws.edit_scope, ws.model = None, saved
     return res.text if res.from_model else ""
 
 
 def run_cycle(task: str, ws: Workspace, author_of, on_progress: Callable[[str], None] | None = None,
-              should_stop: Callable[[], bool] | None = None, english_reply: bool = False, max_rounds: int = 2,
-              analyzers: list[Analyzer] | None = None, runner=None) -> AnalysisReport:
-    """Анализ, возврат новых замечаний авторам, повторный анализ. Кругов исправления не больше двух."""
+              should_stop: Callable[[], bool] | None = None, english_reply: bool = False, max_rounds: int = MAX_ROUNDS,
+              analyzers: list[Analyzer] | None = None, runner=None, terminal=None) -> AnalysisReport:
+    """Анализ, возврат новых замечаний авторам (Claude), повторный анализ, и так пока новых замечаний нет.
+    Раньше останавливается, если те же замечания не уходят или автор ничего не меняет."""
     say = on_progress or (lambda _: None)
     stop = should_stop or (lambda: False)
     report = AnalysisReport()
+    seen: list[frozenset] = []
     for round_no in range(max_rounds + 1):
         if stop():
             report.stopped = "остановлено пользователем"
@@ -323,8 +332,16 @@ def run_cycle(task: str, ws: Workspace, author_of, on_progress: Callable[[str], 
             report.skipped = skipped
             break
         report.rounds.append(rnd)
-        if not rnd.issues or round_no == max_rounds:
+        if not rnd.issues:
             break
+        if round_no == max_rounds:
+            report.stalled = f"достигнут предел кругов статанализа ({max_rounds}), замечания остались"
+            break
+        sig = frozenset(i.key() for i in rnd.issues)
+        if sig in seen:
+            report.stalled = "те же замечания статанализа повторились после исправления"
+            break
+        seen.append(sig)
         say(f"статанализ: новых замечаний {len(rnd.issues)}, возвращаю авторам")
         before = ws.review_diff()
         by_author: dict[str, tuple] = {}
@@ -333,7 +350,9 @@ def run_cycle(task: str, ws: Workspace, author_of, on_progress: Callable[[str], 
             worker = author_of(real) if real is not None else author_of(None)
             by_author.setdefault(worker.key, (worker, []))[1].append(issue)
         for worker, items in by_author.values():
-            _fix(task, ws, worker, items, on_progress, should_stop, english_reply)
+            _fix(task, ws, worker, items, on_progress, should_stop, english_reply, terminal)
         if ws.review_diff() == before:
+            report.stalled = "автор не изменил код"
             break
+        report.fixes += 1
     return report

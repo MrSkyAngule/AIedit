@@ -13,12 +13,15 @@
 попадает. Каждую команду одобряет человек. На Windows песочницы нет: редактор можно запустить в WSL.
 """
 import ast
+import json
+import re
 import os
 import shlex
 import shutil
 import sys
 import tempfile
 import textwrap
+import urllib.parse
 from pathlib import Path
 from typing import Callable
 
@@ -97,10 +100,49 @@ def blank_python(code: str) -> list[str]:
     return [indent + ("pass" if all(isinstance(n, _DEFINITIONS) for n in tree.body) else STUB)]
 
 
-def sandbox_text(ws: Workspace, st: FileState) -> str:
+_DEF_NAME = re.compile(r"^\s*(?:async\s+def|def|class)\s+(\w+)|^(\w+) = \.\.\.")
+
+
+def closed_names(code: str) -> list[str]:
+    """Имена из куска interface: они модели и так видны в заглушке, значит, их можно назвать в подсказке."""
+    names: list[str] = []
+    for sig in guard.signatures(code):
+        m = _DEF_NAME.match(sig)
+        name = m and (m[1] or m[2])
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def closed_notice(closed: dict) -> str:
+    """Что в копии проекта закрыто, для модели: иначе None и NameError она принимает за ошибку своего кода
+    и подставляет свои значения, чтобы запуск «прошёл»."""
+    rows = []
+    for name, e in sorted(closed.items())[:10]:
+        parts = []
+        if e["names"]:
+            parts.append(", ".join(e["names"][:20])
+                         + " (real values are not available: variables are None, functions raise NotImplementedError)")
+        if e["hidden"]:
+            parts.append(f"{e['hidden']} hidden line(s) are gone")
+        if parts:
+            rows.append(f"- {name}: " + "; ".join(parts))
+    if not rows:
+        return ""
+    return ("\nclosed in this sandbox (the real values are NOT here):\n" + "\n".join(rows)
+            + "\nUse these names as they are (call the functions, pass the real variable): the code will have the real "
+              "values. But do not invent your own values for them, and do not count a run that depends on them as proof "
+              "that the code works. If you need sample data for a test, call it sample data. Say what you could not verify.")
+
+
+def sandbox_text(ws: Workspace, st: FileState, closed: dict | None = None) -> str:
     """Текст файла для копии: закрытые зоны и секреты заменены. Число строк по возможности то же,
-    чтобы номера строк в ошибках совпадали с тем, что видит модель."""
+    чтобы номера строк в ошибках совпадали с тем, что видит модель.
+    closed (если дан) пополняется: что именно в этом файле закрыто (для подсказки модели)."""
     regions = sorted((r for r in ws.view_regions(st) if r.level in guard.CONCEALED), key=lambda r: r.start)
+    entry = {"names": [], "hidden": 0}
+    if closed is not None:
+        closed.pop(ws.rel(st.path), None)  # файл могли пересобрать: считаем заново, а не добавляем
     if not regions:
         return st.text
     lines = st.text.split("\n")
@@ -115,13 +157,19 @@ def sandbox_text(ws: Workspace, st: FileState) -> str:
         size = r.end - r.start + 1
         code = "\n".join(lines[r.start:r.end + 1])
         stub = (stub_python(code) if r.level == "interface" else blank_python(code)) if python else []
+        if r.level == "interface" and python:
+            entry["names"] += [n for n in closed_names(code) if n not in entry["names"]]
+        else:
+            entry["hidden"] += size
         out += stub + [""] * max(0, size - len(stub))
         pos = r.end + 1
+    if closed is not None and (entry["names"] or entry["hidden"]):
+        closed[ws.rel(st.path)] = entry
     return "\n".join(out + lines[pos:])
 
 
 # --- копия проекта ---
-def _file_text(ws: Workspace, real: Path) -> str | None | bool:
+def _file_text(ws: Workspace, real: Path, closed: dict | None = None) -> str | None | bool:
     """Текст для копии; None - копировать как есть (не текст); False - не копировать."""
     cached = real in ws.states
     st = ws.state(real)
@@ -129,10 +177,10 @@ def _file_text(ws: Workspace, real: Path) -> str | None | bool:
         del ws.states[real]  # копия не должна менять рабочую область агента
     if isinstance(st, str):
         return None if "not a text file" in st else False  # большие и устаревшие - не копируем
-    return sandbox_text(ws, st)
+    return sandbox_text(ws, st, closed)
 
 
-def build_copy(ws: Workspace, dest: Path) -> list[str]:
+def build_copy(ws: Workspace, dest: Path, closed: dict | None = None) -> list[str]:
     """Копия видимых файлов с заглушками. Возвращает заметки о пропущенном (для человека)."""
     skipped: list[str] = []
     files = size = 0
@@ -152,7 +200,7 @@ def build_copy(ws: Workspace, dest: Path) -> list[str]:
                 raise TooBig()
             target = dest / real.relative_to(ws.root)
             target.parent.mkdir(parents=True, exist_ok=True)
-            text = _file_text(ws, real)
+            text = _file_text(ws, real, closed)
             if text is False:
                 skipped.append(ws.rel(real))
             elif text is None:
@@ -218,8 +266,9 @@ SEATBELT_SERVICES = ("com.apple.system.logger", "com.apple.system.notification_c
                      "com.apple.system.opendirectoryd.libinfo")
 
 
-def seatbelt_profile(work: Path, tmp: Path, venv: Path | None = None, extra_ro=()) -> str:
-    """Профиль sandbox-exec: запрещено всё, кроме перечисленного. Ошибка в списке ломает запуск, а не защиту."""
+def seatbelt_profile(work: Path, tmp: Path, venv: Path | None = None, extra_ro=(), hide=()) -> str:
+    """Профиль sandbox-exec: запрещено всё, кроме перечисленного. Ошибка в списке ломает запуск, а не защиту.
+    hide - что в разрешённом прятать (venv_shadows): правило запрета идёт последним, оно сильнее."""
     readable = [*SEATBELT_SYSTEM, work, tmp, *extra_ro]
     if venv is not None:
         readable.append(venv)
@@ -237,10 +286,12 @@ def seatbelt_profile(work: Path, tmp: Path, venv: Path | None = None, extra_ro=(
         f'(allow file-write* (subpath {_sb(work)}) (subpath {_sb(tmp)}) (literal "/dev/null") (literal "/dev/zero")'
         ' (regex #"^/dev/tty"))',
         "(deny network*)",
+        *([f"(deny file-read* {' '.join(('(subpath ' if Path(p).is_dir() else '(literal ') + _sb(p) + ')' for p in hide)})"]
+          if hide else []),
     ])
 
 
-def seatbelt_argv(command: str, work: Path, tmp: Path, venv: Path | None = None, extra_ro=()) -> list[str]:
+def seatbelt_argv(command: str, work: Path, tmp: Path, venv: Path | None = None, extra_ro=(), hide=()) -> list[str]:
     path = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"
     env = [f"HOME={os.path.realpath(tmp)}", f"TMPDIR={os.path.realpath(tmp)}", "LANG=en_US.UTF-8",
            "PYTHONDONTWRITEBYTECODE=1"]
@@ -248,11 +299,11 @@ def seatbelt_argv(command: str, work: Path, tmp: Path, venv: Path | None = None,
         path = f"{venv}/bin:{path}"
         env.append(f"VIRTUAL_ENV={venv}")
     return ["/usr/bin/env", "-i", f"PATH={path}", *env, SEATBELT, "-p",
-            seatbelt_profile(work, tmp, venv, extra_ro), "/bin/sh", "-c", command]
+            seatbelt_profile(work, tmp, venv, extra_ro, hide), "/bin/sh", "-c", command]
 
 
 def run_seatbelt(command: str, work: Path, venv: Path | None = None, extra_ro: dict[str, Path] | None = None,
-                 timeout: float = TIMEOUT) -> checks.CheckResult:
+                 timeout: float = TIMEOUT, hide=()) -> checks.CheckResult:
     links = []
     for name, real in (extra_ro or {}).items():  # node_modules: ссылкой, читать можно по разрешению в профиле
         link = work / name
@@ -261,7 +312,7 @@ def run_seatbelt(command: str, work: Path, venv: Path | None = None, extra_ro: d
             links.append(link)
     with tempfile.TemporaryDirectory(prefix="aiedit-tmp-") as tmp:
         res = checks.run_command(shlex.join(seatbelt_argv(command, work, Path(tmp), venv,
-                                                          list((extra_ro or {}).values()))), work, timeout)
+                                                          list((extra_ro or {}).values()), hide)), work, timeout)
     for link in links:
         link.unlink(missing_ok=True)
     res.command = command
@@ -269,11 +320,12 @@ def run_seatbelt(command: str, work: Path, venv: Path | None = None, extra_ro: d
 
 
 def run_sandboxed(command: str, work: Path, venv: Path | None = None, extra_ro: dict[str, Path] | None = None,
-                  timeout: float = TIMEOUT) -> checks.CheckResult:
-    return (run_seatbelt if kind() == "seatbelt" else run_bwrap)(command, work, venv, extra_ro, timeout)
+                  timeout: float = TIMEOUT, hide=()) -> checks.CheckResult:
+    return (run_seatbelt if kind() == "seatbelt" else run_bwrap)(command, work, venv, extra_ro, timeout, hide=hide)
 
 
-def bwrap_argv(command: str, work: Path, venv: Path | None = None, extra_ro: dict[str, Path] | None = None) -> list[str]:
+def bwrap_argv(command: str, work: Path, venv: Path | None = None, extra_ro: dict[str, Path] | None = None,
+               hide=()) -> list[str]:
     argv = ["bwrap", "--die-with-parent", "--new-session", "--unshare-all", "--cap-drop", "ALL",
             "--ro-bind", "/usr", "/usr"]
     for d in ("bin", "sbin", "lib", "lib32", "lib64"):
@@ -294,14 +346,16 @@ def bwrap_argv(command: str, work: Path, venv: Path | None = None, extra_ro: dic
             argv += ["--ro-bind", os.path.realpath(base), str(base)]
         path = f"{venv}/bin:{path}"
         env += ["--setenv", "VIRTUAL_ENV", str(venv)]
+        for p in hide:  # копии кода самого проекта в venv: папку закрываем пустой, файл - пустым файлом
+            argv += ["--tmpfs", str(p)] if Path(p).is_dir() else ["--ro-bind", "/dev/null", str(p)]
     for name, real in (extra_ro or {}).items():
         argv += ["--ro-bind", str(real), f"{WORK}/{name}"]
     return argv + ["--chdir", WORK, "--clearenv", "--setenv", "PATH", path, *env, "/bin/sh", "-c", command]
 
 
 def run_bwrap(command: str, work: Path, venv: Path | None = None, extra_ro: dict[str, Path] | None = None,
-              timeout: float = TIMEOUT) -> checks.CheckResult:
-    res = checks.run_command(shlex.join(bwrap_argv(command, work, venv, extra_ro)), work, timeout)
+              timeout: float = TIMEOUT, hide=()) -> checks.CheckResult:
+    res = checks.run_command(shlex.join(bwrap_argv(command, work, venv, extra_ro, hide)), work, timeout)
     res.command = command
     return res
 
@@ -325,6 +379,75 @@ def project_venv(root: Path) -> Path | None:
         if (p / "bin" / "python").exists() and Path(os.path.realpath(p)).is_relative_to(root):
             return p
     return None
+
+
+def project_names(root: Path) -> set[str]:
+    """Имена модулей и пакетов верхнего уровня самого проекта: в корне и в src/."""
+    names: set[str] = set()
+    for base in (root, root / "src"):
+        try:
+            entries = list(base.iterdir())
+        except OSError:
+            continue
+        for e in entries:
+            if e.name.startswith(".") or e.name in SKIP_DIRS:
+                continue
+            if e.is_file() and e.suffix in PY_SUFFIXES:
+                names.add(e.stem)
+            elif e.is_dir() and any(e.glob("*.py")):
+                names.add(e.name)
+    return names
+
+
+def _installed_from(dist: Path, root: Path) -> bool:
+    """Пакет поставлен из папки проекта копией (обычный pip install ., не -e)."""
+    try:
+        data = json.loads((dist / "direct_url.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    url = str(data.get("url", ""))
+    if not url.startswith("file://") or (data.get("dir_info") or {}).get("editable"):
+        return False
+    src = Path(os.path.realpath(urllib.parse.unquote(urllib.parse.urlsplit(url).path)))
+    return src.is_relative_to(root)
+
+
+def _record_names(dist: Path) -> set[str]:
+    """Что пакет положил в site-packages (по его списку файлов RECORD): имена верхнего уровня."""
+    try:
+        rows = (dist / "RECORD").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return set()
+    tops = {row.split(",", 1)[0].split("/", 1)[0] for row in rows}
+    return {t.split(".")[0] for t in tops if t and t not in ("..", "__pycache__") and not t.endswith(".dist-info")}
+
+
+def venv_shadows(root: Path, venv: Path | None) -> list[Path]:
+    """Копии кода самого проекта в его окружении, которые песочница прячет.
+
+    Обычный `pip install .` (не -e) кладёт в site-packages полную копию проекта, с закрытыми зонами и закрытыми
+    файлами. Окружение песочница подключает целиком (там библиотеки для тестов), поэтому такую копию надо закрыть,
+    иначе `cat .venv/lib/.../модуль.py` покажет модели всё. Узнаём копию по имени (как модуль или пакет в корне
+    проекта) и по записи pip, что пакет поставлен из папки проекта. Тесты в песочнице при этом импортируют
+    модули из копии проекта: текущая папка в пути поиска стоит раньше site-packages."""
+    if venv is None:
+        return []
+    root = Path(os.path.realpath(root))
+    names = project_names(root)
+    out: list[Path] = []
+    for site in sorted(venv.glob("lib/python*/site-packages")):
+        own = set(names)
+        for dist in site.glob("*.dist-info"):
+            if _installed_from(dist, root):
+                own |= _record_names(dist)
+        if not own:
+            continue
+        for e in sorted(site.iterdir()):
+            if e.name == "__pycache__":
+                out += [c for c in sorted(e.iterdir()) if c.name.split(".")[0] in own]
+            elif not e.name.endswith((".dist-info", ".pth")) and (e.name if e.is_dir() else e.name.split(".")[0]) in own:
+                out.append(e)
+    return out
 
 
 _SHELL_META = set(";&|`$<>()\n\\*?{}[]~")
@@ -356,6 +479,7 @@ class ProjectCopy:
         self.tmp: tempfile.TemporaryDirectory | None = None
         self.synced: dict[Path, str | None] = {}  # что записано в копию; None - удалён
         self.skipped: list[str] = []
+        self.closed: dict[str, dict] = {}  # файл -> {"names": закрытые имена interface, "hidden": строк hidden}
 
     @property
     def path(self) -> Path:
@@ -365,7 +489,7 @@ class ProjectCopy:
         """Создаёт копию (если её ещё нет) и переносит в неё правки агента. Возвращает изменённые файлы копии."""
         if self.tmp is None:
             self.tmp = tempfile.TemporaryDirectory(prefix=self.prefix)
-            self.skipped = build_copy(self.ws, self.path)
+            self.skipped = build_copy(self.ws, self.path, self.closed)
         changed = []
         for path, st in self.ws.states.items():
             target = self.path / path.relative_to(self.ws.root)
@@ -377,7 +501,7 @@ class ProjectCopy:
                 continue
             if st.base is not None and st.text == st.base and path not in self.synced:
                 continue  # не менялся (если правку откатили, копию надо вернуть - тогда он в synced)
-            text = sandbox_text(self.ws, st)
+            text = sandbox_text(self.ws, st, self.closed)
             if self.synced.get(path) != text:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(text, encoding="utf-8")
@@ -429,7 +553,11 @@ class Terminal:
         except TooBig:
             return "ERROR: the project is too large for the sandbox"
         extra = {d: self.ws.root / d for d in ("node_modules",) if (self.ws.root / d).is_dir()}
-        res = (self.runner or run_sandboxed)(command, self.work, project_venv(self.ws.root), extra, self.timeout)
+        venv = project_venv(self.ws.root)
+        if self.runner is not None:
+            res = self.runner(command, self.work, venv, extra, self.timeout)
+        else:
+            res = run_sandboxed(command, self.work, venv, extra, self.timeout, hide=venv_shadows(self.ws.root, venv))
         self.runs += 1
         if self.show:
             self.show(res)
@@ -448,7 +576,7 @@ class Terminal:
         note = ""
         if self.skipped:
             note = "\nnote: some files are missing from the sandbox copy: " + ", ".join(self.skipped[:10])
-        return f"$ {res.command}\n{status}\n{output or '(no output)'}{note}"
+        return f"$ {res.command}\n{status}\n{output or '(no output)'}{note}{closed_notice(self.copy.closed)}"
 
     def close(self):
         self.copy.close()

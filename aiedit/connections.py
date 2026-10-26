@@ -130,15 +130,31 @@ def _translator(rows: dict[str, Connection], roles: Roles) -> Provider | None:
     return catalog.make_provider(c.model, c.key.strip(), c.extra, role="translator")
 
 
+def is_quota_error(text: str) -> bool:
+    """Сервис (чаще шлюз-посредник) отказал из-за денег или лимита ключа, а не из-за неверного ключа."""
+    low = text.lower()
+    return any(w in low for w in ("insufficient", "quota", "balance", "exceeded your current", "额度", "余额"))
+
+
 def ping(provider: Provider) -> tuple[bool, str]:
-    """Проверка подключения одним коротким запросом. Текст ошибки без ключа."""
+    """Проверка подключения одним коротким запросом. Текст ошибки без ключа. Без повторов: проверка отвечает сразу."""
+    retries = getattr(provider, "retries", None)
+    if retries is not None:
+        provider.retries = 0
     try:
         provider.complete("Reply with the single word OK.", [{"role": "user", "content": "ping"}])
     except urllib.error.HTTPError as e:
         e.close()
         hint = {401: "ключ не принят", 403: "доступ запрещён", 404: "модель или адрес не найдены",
                 429: "лимит запросов"}.get(e.code, "ошибка сервиса")
-        return False, f"{hint} (HTTP {e.code})"
+        reason = str(e.reason)
+        if is_quota_error(reason):
+            hint = "на ключе закончились деньги или лимит"
+        detail = reason.partition(": ")[2][:160]  # причина от самого сервиса, если он её назвал
+        return False, f"{hint} (HTTP {e.code})" + (f": {detail}" if detail and e.code not in (401, 404) else "")
     except Exception as e:  # сеть, таймаут, неожиданный ответ
         return False, f"{type(e).__name__}: {e}"
+    finally:
+        if retries is not None:
+            provider.retries = retries
     return True, "работает"

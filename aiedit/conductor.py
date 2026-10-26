@@ -10,7 +10,7 @@ from pathlib import Path
 
 from typing import Callable
 
-from . import agent, analysis, orchestrator, policy, project_rules, prompts, review as security
+from . import agent, orchestrator, pipeline, policy, project_rules, prompts
 from .outbound import SendCancelled
 from .providers import Provider
 from .roster import Roster, Worker
@@ -220,7 +220,8 @@ def summarize(plan: Plan, results: list[TaskResult]) -> str:
 def run(task: str, ws: Workspace, roster: Roster, conductor: Provider, history: list | None = None,
         open_file: Path | None = None, on_progress: Callable[[str], None] | None = None,
         should_stop: Callable[[], bool] | None = None, english_reply: bool = False,
-        review_on: bool = True, analyze_on: bool = True, ask=None, **helpers) -> ConductResult:
+        review_on: bool = True, analyze_on: bool = True, ask=None, verify_command: str = "", verify_on: bool = True,
+        **helpers) -> ConductResult:
     """План от дирижёра, затем шаги по порядку у назначенных исполнителей на общей рабочей области.
     Потом, если подключён проверяющий, он смотрит все правки, а серьёзные замечания уходят их авторам.
     ask - вопрос человеку: исполнитель может переспросить посреди своего шага.
@@ -282,12 +283,11 @@ def run(task: str, ws: Workspace, roster: Roster, conductor: Provider, history: 
     out.results = results
     out.text = summarize(plan, results)
     out.text_en = ""
-    if analyze_on and not out.stopped and ws.changes():  # сначала настоящие программы, потом безопасник
-        out.analysis = analysis.run_cycle(task, ws, lambda p: authors.get(p) or roster.strongest(),
-                                          on_progress, should_stop, english_reply)
-    if review_on and not out.stopped and roster.reviewer() is not None and ws.changes():
-        out.review = security.run_cycle(task, ws, roster, lambda p: authors.get(p) or roster.strongest(),
-                                        on_progress, should_stop, english_reply)
+    if not out.stopped and ws.changes():  # тесты до зелёного -> GLM -> тесты -> статанализ (см. pipeline)
+        out.analysis, out.review, out.verification = pipeline.run(
+            task, ws, roster, lambda p: authors.get(p) or roster.strongest(), on_progress, should_stop, english_reply,
+            review_on=review_on, analyze_on=analyze_on, terminal=helpers.get("terminal"),
+            verify_command=verify_command, verify_on=verify_on, helpers=pipeline.fix_helpers(helpers))
     out.changes = ws.changes()
     out.authors = {ws.rel(p): w.key for p, w in authors.items()}
     return out

@@ -182,3 +182,14 @@ class RosterTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CanSplitTest(unittest.TestCase):
+    def test_one_builder_cannot_split_even_with_a_reviewer(self):
+        from aiedit.providers import DemoProvider
+        from aiedit.roster import Roster, Worker
+        one = Roster([Worker("a", DemoProvider("a"), "", 1, 1, "mid"),
+                      Worker("glm", DemoProvider("g"), "", 0, 0, "mid", "security")])
+        self.assertFalse(one.can_split())
+        two = Roster([Worker("a", DemoProvider("a"), "", 1, 1, "mid"), Worker("b", DemoProvider("b"), "", 1, 1, "strong")])
+        self.assertTrue(two.can_split())

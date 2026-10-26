@@ -14,7 +14,7 @@ class Doc:
         self.marks = Marks()
         self.silent = False  # true, пока текст заменяется целиком (загрузка, правка ИИ)
         self.block_count = 1
-        self.saved_marks: list = []  # зоны, как они лежат на диске
+        self.saved_marks: tuple = ((), (), ())  # зоны и отметки для себя, как они лежат на диске
         self.on_save_error = None    # куда сообщить, если зоны сохранить не удалось
         self._error_reported = False
         self.editor = CodeEdit()
@@ -54,13 +54,14 @@ class Doc:
     def paint(self):
         self.marks.remember(self.text())
         self.editor.set_regions(guard.line_regions(self.editor.blockCount(), self.marks.items))
+        self.editor.set_human(self.marks.human)
         self.autosave_marks()
 
     def autosave_marks(self) -> bool:
         """Зоны переживают закрытие вкладки и программы: пишутся сразу, как только изменились.
         Пока в файле есть несохранённый текст, ждём его сохранения: номера строк относятся к тексту в окне,
         и на диск они должны попасть вместе с ним."""
-        if self.path is None or self.modified or self.marks.items == self.saved_marks:
+        if self.path is None or self.modified or self.marks.state() == self.saved_marks:
             return True
         try:
             self.marks.save(self.path, self.text())
@@ -70,7 +71,7 @@ class Doc:
             self._error_reported = True
             return False
         self._error_reported = False
-        self.saved_marks = list(self.marks.items)
+        self.saved_marks = self.marks.state()
         return True
 
     def replace_text(self, text: str):
@@ -85,7 +86,8 @@ class Doc:
         self.replace_text(text)
         self.set_path(path)
         fresh = self.marks.load(path, text)
-        self.saved_marks = list(self.marks.items)
+        # старый файл зон без отпечатков закрытого кода: перепишется при первой отрисовке
+        self.saved_marks = None if fresh and self.marks.outdated else self.marks.state()
         self.paint()
         return fresh
 
@@ -93,5 +95,5 @@ class Doc:
         text = self.text()
         self.path.write_text(text, encoding="utf-8")
         self.marks.save(self.path, text)
-        self.saved_marks = list(self.marks.items)
+        self.saved_marks = self.marks.state()
         self.editor.document().setModified(False)

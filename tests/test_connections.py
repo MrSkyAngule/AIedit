@@ -188,3 +188,38 @@ class PingTest(Env):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GatewayTest(unittest.TestCase):
+    URL = "https://gw.example/v1"
+
+    def test_catalog_model_goes_through_the_gateway_in_openai_format(self):
+        from aiedit import catalog
+        from aiedit.providers import OpenAIProvider
+        p = catalog.make_provider("opus", "k", self.URL)
+        self.assertIsInstance(p, OpenAIProvider)
+        self.assertEqual((p.model, p.url), ("claude-opus-5-5", "https://gw.example/v1/chat/completions"))
+        self.assertEqual(catalog.make_provider("opus", "k", self.URL + "/").url, p.url)  # слэш в конце не мешает
+
+    def test_without_a_gateway_nothing_changes(self):
+        from aiedit import catalog
+        from aiedit.providers import AnthropicProvider
+        self.assertIsInstance(catalog.make_provider("opus", "k"), AnthropicProvider)
+
+    def test_bad_gateway_address_is_refused_with_a_reason(self):
+        from aiedit import catalog
+        with self.assertRaises(ValueError):
+            catalog.make_provider("sonnet", "k", "gw.example/v1")
+
+    def test_specialties_prices_and_roles_survive_the_gateway(self):
+        from aiedit.connections import Connection, Roles, build
+        s = build([Connection("sonnet", "k1", self.URL), Connection("opus", "k2", self.URL),
+                   Connection("glm", "k3", "glm-5.3 | " + self.URL)], Roles(conductor="sonnet", translator="off"))
+        self.assertEqual(s.problems, [])
+        self.assertEqual(s.roster.get("opus").specialty, "backend")
+        self.assertEqual(s.roster.get("opus").price_in, 4.0)
+        self.assertTrue(s.roster.get("glm").is_reviewer)
+        self.assertEqual(s.roster.reviewer().key, "glm")
+        self.assertTrue(s.roster.can_split())
+        self.assertEqual(s.conductor.url, "https://gw.example/v1/chat/completions")
+        self.assertEqual(s.conductor.max_tokens, 1500)  # лимиты роли дирижёра сохранились

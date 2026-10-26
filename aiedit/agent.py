@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from . import context, orchestrator, policy, project_rules, prompts
+from . import context, environment, orchestrator, policy, project_rules, prompts
 from .providers import Provider
 from .workspace import Change, Workspace
 
@@ -32,11 +32,21 @@ MAX_STEPS = 40  # потом редактор спрашивает челове�
 MAX_CALLS_PER_REPLY = 8
 MAX_NOTES = 4000
 MAX_QUESTIONS = 3  # больше - значит модель перекладывает работу на человека
+ENV_IN_FIRST_MESSAGE = 1200  # сколько символов описания окружения проекта кладём в первое сообщение
+HINT_AFTER_PASSES = 2  # проверка прошла столько раз подряд: напоминаем, что пора заканчивать
+LOOP_PASSES = 4        # ...а столько раз подряд и агент всё ещё правит: останавливаем сами
+LOOP_SAME_REPLY = 3    # столько раз подряд один и тот же набор вызовов
+_EXIT = re.compile(r"^exit code (-?\d+)\s*$", re.M)
 
 SYSTEM = prompts.AGENT_SYSTEM
 
 _BLOCK = re.compile(r"^@@tool[ \t]+(\w+)[ \t]*\n(.*?)^@@end[ \t]*$", re.S | re.M)
 _SECTION = re.compile(r"^@@(old|new|content|question|notes)[ \t]*$", re.M)
+# слабые модели пишут `@@old|текст` или `@@old: текст` (привычка из YAML): текст после маркера переносим на следующую строку
+# ответ редактора модель писать не должна, но иногда дописывает его сама, прямо за @@end, иногда с хвостом </think>
+_END_TAIL = re.compile(r"^(@@end)(?:[ \t]*</?[A-Za-z]+>)+[ \t]*", re.M)
+_RESULT_LINE = re.compile(r"^@@result\b", re.M)
+_GLUED = re.compile(r"^(@@(?:old|new|content|question|notes))[ \t]*[|:](.*)$", re.M)
 
 TOOLS: dict[str, dict] = {
     "list_files": {"path": str, "depth": int},
@@ -54,6 +64,12 @@ TOOLS: dict[str, dict] = {
     "fetch_url": {"url": str},  # открывает редактор, только сайты из списка или с одобрения (web.Web)
     "web_search": {"query": str},  # поиск через Brave (search.Search)
     "install_packages": {"packages": str},  # ставит редактор, с одобрения (packages.Installer)
+    "project_environment": {},  # что проект сам говорит о версиях и ПО (environment.describe), без запуска программ
+    "package_version": {"name": str},  # актуальная версия пакета из реестра (versions.lookup), если интернет разрешён
+}
+FORMAT_HINTS = {
+    "edit_file": "@@tool edit_file\npath: main.py\n@@old\nexact old text\n@@new\nnew text\n@@end",
+    "create_file": "@@tool create_file\npath: new.py\n@@content\nfile text\n@@end",
 }
 _SECTION_ARG = {"old": "old_text", "new": "new_text", "content": "content", "question": "question", "notes": "notes"}
 
@@ -78,6 +94,7 @@ class AgentResult:
     from_model: bool = True  # text - ответ модели, а не наше сообщение об остановке
     review: object | None = None  # review.ReviewReport, если шла проверка безопасностью
     analysis: object | None = None  # analysis.AnalysisReport, если шёл статанализ
+    verification: object | None = None  # verify.VerifyReport: что показал запуск тестов редактором (зелёный или красный)
     authors: dict[str, str] = field(default_factory=dict)  # путь -> кто последним писал файл (для журнала правок)
     sent: int = 0  # сколько символов ушло модели за все запросы (для человека: расход)
     usage: dict = field(default_factory=dict)  # точный расход по ответам API: input, cache_read, cache_write, output
@@ -94,15 +111,39 @@ def _coerce(value: str, kind):
     return value
 
 
+def _hint(name: str) -> str:
+    """Что дописать к ошибке разбора: пример правильного вызова, чтобы модель сама исправилась."""
+    example = FORMAT_HINTS.get(name, f"@@tool {name}\nargument: value\n@@end")
+    return ("\nCorrect format (each @@ marker alone on its own line, text starts on the next line, "
+            "no | or : after the marker):\n" + example)
+
+
+def _unglue(body: str) -> str:
+    return _GLUED.sub(lambda m: m[1] + ("\n" + m[2] if m[2].strip() else ""), body)
+
+
+def strip_fake_results(reply: str) -> tuple[str, bool]:
+    """Убирает то, что модель дописала за редактор: блоки @@result и всё после них (оно построено на выдумке).
+    Внутри блока @@tool слова @@result - просто текст, например в правке файла, там ничего не режем.
+    Возвращает (чистый ответ, был ли выдуманный результат)."""
+    reply = _END_TAIL.sub(lambda m: m[1] + "\n", reply)
+    spans = [m.span() for m in _BLOCK.finditer(reply)]
+    for m in _RESULT_LINE.finditer(reply):
+        if not any(a <= m.start() < b for a, b in spans):
+            return reply[:m.start()].rstrip() + "\n", True
+    return reply, False
+
+
 def parse_calls(reply: str) -> tuple[list[Call], str]:
     """Достаёт вызовы инструментов. Возвращает (вызовы, текст вне блоков)."""
     calls = []
+    reply, _ = strip_fake_results(reply)
     for m in _BLOCK.finditer(reply):
         name, body = m[1], m[2]
         if name not in TOOLS:
             calls.append(Call(name, {}, f"unknown tool {name!r}; available: {', '.join(TOOLS)}"))
             continue
-        head, *rest = _SECTION.split(body)
+        head, *rest = _SECTION.split(_unglue(body))
         args: dict = {}
         error = ""
         for line in head.split("\n"):
@@ -111,7 +152,7 @@ def parse_calls(reply: str) -> tuple[list[Call], str]:
             key, sep, val = line.partition(":")
             key = key.strip()
             if not sep or key not in TOOLS[name]:
-                error = f"bad or extra argument line: {line.strip()[:60]!r}"
+                error = f"bad or extra argument line: {line.strip()[:60]!r}" + _hint(name)
                 break
             try:
                 args[key] = _coerce(val, TOOLS[name][key])
@@ -138,7 +179,7 @@ def execute(ws: Workspace, call: Call) -> str:
                 "delete_file": ["path"], "rename_file": ["path", "new_path"]}.get(call.name, [])
     missing = [r for r in required if r not in call.args]
     if missing:
-        return f"ERROR: missing arguments: {', '.join(missing)}"
+        return f"ERROR: missing arguments: {', '.join(missing)}" + (_hint(call.name) if call.name in FORMAT_HINTS else "")
     try:
         return getattr(ws, call.name)(**call.args)
     except policy.AccessDenied:
@@ -178,6 +219,10 @@ def describe_call(call: Call) -> str:
         return f"ищу в интернете: {a.get('query', '?')[:120]}"
     if call.name == "install_packages":
         return f"прошу установить: {a.get('packages', '?')[:120]}"
+    if call.name == "project_environment":
+        return "смотрю версии и ПО проекта"
+    if call.name == "package_version":
+        return f"проверяю версию пакета: {a.get('name', '?')[:60]}"
     return call.name
 
 
@@ -187,6 +232,8 @@ HELPED = {
     "fetch_url": ("url", "ERROR: no web access here. Rely on what you know and say what you are unsure about."),
     "install_packages": ("packages", "ERROR: installing packages is not available here. Tell the user what to install."),
     "web_search": ("query", "ERROR: web search is not set up. Rely on what you know or ask the user for a link."),
+    "package_version": ("name", "ERROR: version lookup is not available here (the internet is off). Do not present "
+                                "remembered versions as current: say they are unverified, or ask the user which versions they use."),
 }
 
 
@@ -212,6 +259,20 @@ def ask_human(call: Call, ask: Callable[[str], str | None] | None, asked: int) -
     return (answer.strip() if answer and answer.strip() else prompts.OUT_NO_ANSWER), True
 
 
+def command_passed(out: str) -> bool | None:
+    """Результат run_command: прошла ли команда. None - в тексте нет кода выхода (не результат команды)."""
+    m = _EXIT.search(out[:400])
+    return None if m is None else int(m[1]) == 0
+
+
+ACTING = ("edit_file", "create_file", "delete_file", "rename_file", "run_command", "install_packages")
+
+
+def call_signature(calls: list[Call]) -> tuple:
+    """Отпечаток правок и запусков в ответе. Чтение и поиск не считаем: их повторы ограничивает лимит шагов."""
+    return tuple((c.name, tuple(sorted((k, str(v)) for k, v in c.args.items()))) for c in calls if c.name in ACTING)
+
+
 def add_usage(total: dict, part: dict | None):
     for k, v in (part or {}).items():
         total[k] = total.get(k, 0) + v
@@ -233,7 +294,13 @@ def first_message(task: str, ws: Workspace, open_file: Path | None = None) -> st
     """Первое сообщение модели: задача, список файлов проекта, имя открытого файла и правила проекта."""
     tree = ws.list_files(".", 2)
     opened = f"\n{prompts.SEC_OPEN}\n{ws.rel(open_file)}" if open_file and ws.resolve(str(open_file)) else ""
-    return f"{task}\n\n{prompts.SEC_TREE}\n{tree}{opened}{project_rules.section(ws)}"
+    if ws.read_only:  # проверяющему окружение и «новый проект» ни к чему
+        kind = ""
+    elif not ws._walk_files(ws.root):
+        kind = f"\n{prompts.SEC_KIND}\n{prompts.KIND_NEW}"
+    else:  # существующий проект: версии и ПО лежат перед глазами у модели, а не только в инструменте, который она может не вызвать
+        kind = f"\n{prompts.SEC_ENV}\n{environment.describe(ws)[:ENV_IN_FIRST_MESSAGE]}"
+    return f"{task}\n\n{prompts.SEC_TREE}\n{tree}{opened}{kind}{project_rules.section(ws)}"
 
 
 def run(task: str, ws: Workspace, provider: Provider, history: list | None = None,
@@ -244,7 +311,8 @@ def run(task: str, ws: Workspace, provider: Provider, history: list | None = Non
         terminal: Callable[[str], str] | None = None, web: Callable[[str], str] | None = None,
         install: Callable[[str], str] | None = None,
         extend: Callable[[int, int], bool] | None = None,
-        search: Callable[[str], str] | None = None, nav: Callable[[str, dict], str] | None = None) -> AgentResult:
+        search: Callable[[str], str] | None = None, nav: Callable[[str, dict], str] | None = None,
+        versions: Callable[[str], str] | None = None) -> AgentResult:
     """Крутит цикл: запрос к модели, выполнение инструментов, ответ редактора, пока не будет итога.
     ask(вопрос) -> ответ человека или None; без ask модель не знает про ask_user и решает сама.
     terminal(команда) -> вывод для модели (sandbox.Terminal); без него run_command нет.
@@ -260,14 +328,18 @@ def run(task: str, ws: Workspace, provider: Provider, history: list | None = Non
     result = AgentResult("", [])
     asked = 0
     if ws.read_only:
-        terminal = web = install = search = None
-    helpers = {"run_command": terminal, "fetch_url": web, "install_packages": install, "web_search": search}
+        terminal = web = install = search = versions = None
+    helpers = {"run_command": terminal, "fetch_url": web, "install_packages": install, "web_search": search,
+               "package_version": versions}
     system = prompts.agent_system(system or SYSTEM, [addon for on, addon in (
         (ask is not None, prompts.ASK_ADDON), (terminal is not None, prompts.TERMINAL_ADDON),
         (web is not None, prompts.WEB_ADDON), (search is not None and web is not None, prompts.SEARCH_ADDON),
-        (install is not None, prompts.INSTALL_ADDON), (nav is not None, prompts.NAV_ADDON)) if on])
+        (install is not None, prompts.INSTALL_ADDON), (nav is not None, prompts.NAV_ADDON),
+        (versions is not None, prompts.VERSIONS_ADDON)) if on])
     full_system = prompts.with_reply(system, english_reply)
     budget, step = max_steps, 0
+    passes = repeats = 0     # проверка прошла подряд; один и тот же набор вызовов подряд
+    last_signature: tuple = ()
     while True:
         if stop():
             result.stopped = "остановлено пользователем"
@@ -292,6 +364,7 @@ def run(task: str, ws: Workspace, provider: Provider, history: list | None = Non
         reply = provider.complete(full_system, messages)
         add_usage(result.usage, getattr(provider, "last_usage", None))
         result.steps = step
+        reply, invented = strip_fake_results(reply)  # в переписке остаётся только то, что модель вправе была написать
         calls, text = parse_calls(reply)
         if not calls:
             result.text = text or reply.strip()
@@ -314,10 +387,25 @@ def run(task: str, ws: Workspace, provider: Provider, history: list | None = Non
                 out = "notes saved" if result.plan else "ERROR: missing arguments: notes"
             elif call.name in HELPED:
                 out = run_helper(call, helpers[call.name])
+                if call.name == "run_command" and (ok := command_passed(out)) is not None:
+                    passes = passes + 1 if ok else 0
             else:
                 out = execute(ws, call)
             blocks.append(f"@@result {call.name}\n{out}\n@@end")
+        if invented:
+            blocks.append(prompts.OUT_INVENTED_RESULT)
+        if passes == HINT_AFTER_PASSES:
+            blocks.append(prompts.OUT_PASSED_TWICE)
         messages.append({"role": "user", "content": "\n\n".join(blocks)})
+        signature = call_signature(calls)
+        repeats = repeats + 1 if signature and signature == last_signature else (1 if signature else 0)
+        last_signature = signature
+        if passes >= LOOP_PASSES or repeats >= LOOP_SAME_REPLY:
+            result.stopped = ("похоже, зациклилось: проверка уже прошла " + f"{passes} раз подряд, а агент всё правит"
+                              if passes >= LOOP_PASSES else
+                              f"похоже, зациклилось: агент {repeats} раза подряд повторил одно и то же")
+            say(result.stopped)
+            break
     result.changes = ws.changes()
     if result.stopped and not result.text:
         result.text = f"Работа остановлена: {result.stopped}."

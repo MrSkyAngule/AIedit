@@ -10,7 +10,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import guard, policy, secrets_scan, sendlog
+from . import copies, guard, policy, secrets_scan, sendlog
 from .guard import Region
 from .marks import Marks, sidecar
 
@@ -34,6 +34,7 @@ class FileState:
     confirm: list[str] = field(default_factory=list)
     base_regions: list[Region] = field(default_factory=list)  # зоны для base (до правок)
     deleted: bool = False  # агент предложил удалить файл (или перенести в другое место)
+    allowed: tuple[str, ...] = ()  # закрытый код из других файлов, который человек разрешил здесь не скрывать
 
 
 @dataclass
@@ -59,8 +60,10 @@ class Workspace:
         self.model = model
         self.states: dict[Path, FileState] = {}
         self.sent: set[Path] = set()  # файлы, содержимое которых уже ушло модели
+        self.closed_seen: dict[Path, int] = {}  # файл -> сколько его строк агент встретил закрытыми (заглушками)
         self.read_only = False  # режим проверки: инструменты правки отказывают
         self.edit_scope: set[Path] | None = None  # если задано, править можно только эти файлы
+        self._copies: copies.Index | None = None  # отпечатки закрытого кода проекта (строятся при первом чтении)
 
     # --- доступ ---
     def resolve(self, rel: str) -> Path | None:
@@ -73,6 +76,8 @@ class Workspace:
         return real if self.visible(real) else None
 
     def visible(self, real: Path) -> bool:
+        if real != self.root and not real.is_relative_to(self.root):
+            return False  # за пределами проекта (например, ссылка наружу): модели этого нет, и проверять незачем
         if policy.is_denied(real) or secrets_scan.suspicious_file(real):
             return False
         return not any(part in SKIP_DIRS for part in real.relative_to(self.root).parts)
@@ -95,8 +100,9 @@ class Workspace:
             return f"ERROR: file not found: {self.rel(real)}"
         key = str(real)
         if key in self.live:
-            text, regions = self.live[key]
-            st = FileState(real, text, list(regions), text, live=True, base_regions=list(regions))
+            text, regions, *rest = self.live[key]  # третьим может идти marks.allowed вкладки
+            st = FileState(real, text, list(regions), text, live=True, base_regions=list(regions),
+                           allowed=tuple(rest[0]) if rest else ())
         else:
             try:
                 if real.stat().st_size > MAX_FILE_BYTES:
@@ -108,16 +114,24 @@ class Workspace:
             if not marks.load(real, text):
                 return (f"ERROR: file unavailable: {self.rel(real)} changed outside the editor, so its "
                         "protection zones are stale. Ask the user to open and save it in the editor.")
-            st = FileState(real, text, list(marks.items), text, base_regions=list(marks.items))
+            st = FileState(real, text, list(marks.items), text, base_regions=list(marks.items),
+                           allowed=tuple(marks.allowed))
         self.states[real] = st
         return st
 
-    @staticmethod
-    def view_regions(st: FileState) -> list[Region]:
-        """Зоны файла плюс скрытые на лету секреты: их модель не видит и менять не может."""
+    @property
+    def copies(self) -> copies.Index:
+        if self._copies is None:
+            self._copies = copies.build(self.root, SKIP_DIRS)
+        return self._copies
+
+    def view_regions(self, st: FileState) -> list[Region]:
+        """Зоны файла плюс скрытые на лету секреты и закрытый код, попавший сюда без своих зон (copies):
+        их модель не видит и менять не может."""
         lines = st.text.split("\n")
         found = secrets_scan.uncovered(secrets_scan.scan(st.text), st.regions, len(lines))
-        return st.regions + [Region("hidden", a, b) for a, b in secrets_scan.to_ranges(found)]
+        stray = copies.regions(copies.find(st.text, st.regions, self.copies, st.allowed))
+        return st.regions + [Region("hidden", a, b) for a, b in secrets_scan.to_ranges(found)] + stray
 
     def view(self, st: FileState) -> guard.Redacted:
         return guard.redact(st.text, self.view_regions(st))
@@ -125,6 +139,9 @@ class Workspace:
     # --- журнал ---
     def log(self, tool: str, result: str, files: list[tuple[Path, guard.Redacted | None]] | None = None,
             chars: int | None = None):
+        for p, r in files or []:
+            if r is not None and r.chunks:
+                self.closed_seen[p] = max(self.closed_seen.get(p, 0), sum(c.count("\n") + 1 for c in r.chunks))
         if not self.log_enabled:
             return
         sendlog.record(None, {
@@ -137,34 +154,48 @@ class Workspace:
     # --- инструменты ---
     def list_files(self, path: str = ".", depth: int = 2) -> str:
         base = self.resolve(path)
-        if base is None or not base.is_dir():
+        if base is None or not (base.is_dir() or self.pending_created(base)):  # папка может быть ещё только в правках
             return f"ERROR: folder not found: {path}"
         depth = max(1, min(int(depth), 5))
         lines: list[str] = []
 
+        created = self.pending_created(base)  # файлы, которые агент создал и которые ещё не на диске
+
         def walk(d: Path, level: int):
             try:
-                entries = sorted(d.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+                disk = list(d.iterdir()) if d.is_dir() else []
             except OSError:
                 return
-            for e in entries:
+            names = {e.name for e in disk}
+            entries = [(e.is_file(), e.name, e) for e in disk]
+            entries += [(True, p.name, p) for p in created if p.parent == d and p.name not in names]
+            entries += [(False, n, d / n) for n in sorted({p.relative_to(d).parts[0] for p in created
+                                                           if d in p.parents and p.parent != d} - names)]
+            for is_file, name, e in sorted(entries, key=lambda t: (t[0], t[1].lower())):
                 real = Path(os.path.realpath(e))
                 if not real.is_relative_to(self.root) or not self.visible(real) or self.pending_delete(real):
                     continue
                 if len(lines) >= MAX_LIST:
                     return
-                if e.is_dir():
-                    lines.append("  " * level + e.name + "/")
+                if not is_file:
+                    lines.append("  " * level + name + "/")
                     if level + 1 < depth:
                         walk(e, level + 1)
-                elif not policy.is_private_name(e.name):
-                    lines.append("  " * level + e.name)
+                elif not policy.is_private_name(name):
+                    lines.append("  " * level + name)
 
         walk(base, 0)
         out = "\n".join(lines) or "(empty)"
         if len(lines) >= MAX_LIST:
             out += f"\n[... first {MAX_LIST} entries shown]"
         self.log("list_files", out)
+        return out
+
+    def project_environment(self) -> str:
+        """Что проект сам сообщает о версиях и ПО: файлы зависимостей, версия Python, установленные пакеты."""
+        from . import environment
+        out = environment.describe(self)
+        self.log("project_environment", out)
         return out
 
     def read_file(self, path: str, start_line: int = 1, end_line: int | None = None) -> str:
@@ -219,6 +250,11 @@ class Workspace:
         self.log("search", out, touched)
         return out
 
+    def pending_created(self, base: Path) -> list[Path]:
+        """Новые файлы под base, которые агент уже создал, а на диске их ещё нет (правки применяет человек)."""
+        return sorted(p for p, st in self.states.items()
+                      if st.base is None and not st.deleted and base in p.parents and not p.exists())
+
     def _walk_files(self, base: Path) -> list[Path]:
         out = []
         for dirpath, dirnames, filenames in os.walk(base):
@@ -227,6 +263,7 @@ class Workspace:
                 real = Path(os.path.realpath(Path(dirpath) / name))
                 if real.is_relative_to(self.root) and self.visible(real) and not policy.is_private_name(name):
                     out.append(real)
+        out += [p for p in self.pending_created(base) if self.visible(p) and not policy.is_private_name(p.name)]
         return out
 
     def _edit_refusal(self, real: Path | None) -> str:
@@ -346,7 +383,7 @@ class Workspace:
     def protected_overview(self, limit: int = 30, scan_limit: int = 5000) -> str:
         """Файлы с зонами защиты: по ним дирижёр оценивает риск шагов. Только видимые модели файлы."""
         rows: dict[Path, list[Region]] = {}
-        for key, (_, regions) in self.live.items():
+        for key, (_, regions, *_rest) in self.live.items():
             real = Path(key)
             if real.is_relative_to(self.root) and self.visible(real):
                 rows[real] = regions
@@ -368,8 +405,8 @@ class Workspace:
         return "\n".join(out[:limit])
 
     # --- материалы для проверяющего ---
-    def _concealed_lines(self, text: str, regions: list[Region]) -> int:
-        st = FileState(Path("x"), text, regions, text)
+    def _concealed_lines(self, text: str, regions: list[Region], allowed=()) -> int:
+        st = FileState(Path("x"), text, regions, text, allowed=tuple(allowed))
         lr = guard.line_regions(len(text.split("\n")), self.view_regions(st))
         return sum(1 for r in lr if r is not None and r.level in guard.CONCEALED)
 
@@ -379,7 +416,7 @@ class Workspace:
         for st in self.states.values():
             if st.text == st.base:
                 continue
-            old_st = FileState(st.path, st.base or "", list(st.base_regions), st.base)
+            old_st = FileState(st.path, st.base or "", list(st.base_regions), st.base, allowed=st.allowed)
             old = guard.redact(old_st.text, self.view_regions(old_st)).text if st.base is not None else ""
             new = self.view(st).text
             name = self.rel(st.path)
@@ -397,7 +434,7 @@ class Workspace:
             st = self.states.get(real) or self.state(real)
             if isinstance(st, str):
                 continue
-            hidden = self._concealed_lines(st.text, st.regions)
+            hidden = self._concealed_lines(st.text, st.regions, st.allowed)
             if hidden:
                 out.append((self.rel(real), hidden, len(st.text.split("\n"))))
         return out
@@ -411,9 +448,14 @@ class Workspace:
 def write_change(change: Change) -> None:
     """Записывает изменение файла на диск вместе с файлом зон. Для файлов без вкладки."""
     change.path.parent.mkdir(parents=True, exist_ok=True)
-    change.path.write_text(change.new, encoding="utf-8")
     marks = Marks()
+    try:  # отметки человека лежат в том же файле: сохраняем их и сдвигаем за правкой, а не затираем
+        previous = change.path.read_text(encoding="utf-8") if change.path.is_file() else None
+        if previous is not None:
+            marks.load(change.path, previous)
+            marks.remap_human(previous, change.new)
+    except (OSError, ValueError, KeyError, TypeError, IndexError):
+        marks.human = []
+    change.path.write_text(change.new, encoding="utf-8")
     marks.items = list(change.regions)
     marks.save(change.path, change.new)
-    if not change.regions:
-        sidecar(change.path).unlink(missing_ok=True)

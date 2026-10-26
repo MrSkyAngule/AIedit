@@ -11,8 +11,8 @@ from .gitpanel import GitPanel
 from .qt import (BINDING, QAction, QApplication, QDockWidget, QFileDialog, QKeySequence, QSize, QToolBar,
                  QInputDialog, QMainWindow, QMessageBox, Qt, QTabWidget, QTextCursor, QThread, QTimer, QVBoxLayout, QWidget,
                  Signal)
-from . import (agent, analysis, checkpoints, checks, codenav, journal, project_rules, conductor, flows, prompts, dialogs, guard, orchestrator, outbound, policy, related,
-               packages, sandbox, search, secrets_scan, sendlog, settings, web)
+from . import (agent, analysis, checkpoints, checks, codenav, copies, journal, project_rules, conductor, flows, prompts, dialogs, guard, orchestrator, outbound, policy, related,
+               packages, sandbox, search, secrets_scan, sendlog, settings, versions, web)
 from . import chatstore
 from .chat import ChatPanel
 from .document import Doc
@@ -22,7 +22,7 @@ from .folder_dialog import FolderDialog
 from .marks import Marks, sidecar
 from .policy import Rules
 from .translator import Translator
-from .workspace import Change, Workspace, write_change
+from .workspace import SKIP_DIRS, Change, Workspace, write_change
 from . import connections
 from .connections_dialog import ConnectionsDialog
 from .journal_dialog import JournalView
@@ -49,14 +49,19 @@ class AgentWorker(QThread):
     progress = Signal(str)
     question = Signal(str)
     command_done = Signal(object)  # checks.CheckResult команды из песочницы - показать человеку
+    typing = Signal(int)           # сколько символов ответа модели уже пришло (потоковая выдача)
     done = Signal(object)
     failed = Signal(str)
 
     def __init__(self, task, ws, provider, history, open_file, translator=None, roster=None,
                  conduct=False, review_on=False, analyze_on=False, approve_command=None, reader=None,
-                 approve_install=None, extend=None, searcher=None):
+                 approve_install=None, extend=None, searcher=None, discuss=False, versions=None,
+                 verify_on=False, verify_command=""):
         super().__init__()
         self.args = (task, ws, provider, history, open_file)
+        self.versions = versions  # versions.lookup, если интернет для ИИ разрешён
+        self.verify_on, self.verify_command = verify_on, verify_command  # тесты до зелёного: запускает редактор
+        self.discuss = discuss  # только разговор: рабочая область read_only, без дирижёра, проверок и терминала
         self.translator = translator
         self.roster = roster      # исполнители; нужны дирижёру и проверке безопасностью
         self.conduct = conduct    # True: provider - это дирижёр
@@ -88,29 +93,51 @@ class AgentWorker(QThread):
     def ask_extend(self, steps: int, sent: int) -> bool:
         return not self.cancel and self.extend is not None and bool(self.extend(steps, sent))
 
+    def providers(self) -> list:
+        found = [self.args[2]] + [w.provider for w in (self.roster.workers.values() if self.roster else [])]
+        return [p for p in found if hasattr(p, "set_progress")]
+
     def run(self):
         task, ws, provider, history, open_file = self.args
+        result, error = None, None
+        for p in self.providers():
+            p.set_progress(self.typing.emit)
         try:
-            if self.conduct:
+            if self.discuss:
+                result = flows.run_agent(task, ws, provider, history, open_file, self.translator,
+                                         on_progress=self.progress.emit, should_stop=lambda: self.cancel,
+                                         web=self.reader, search=self.searcher, nav=self.nav,
+                                         system=prompts.DISCUSS_SYSTEM, versions=self.versions)
+            elif self.conduct:
                 result = flows.run_conductor(task, ws, self.roster, provider, history, open_file, self.translator,
                                              on_progress=self.progress.emit, should_stop=lambda: self.cancel,
                                              review_on=self.review_on, analyze_on=self.analyze_on, ask=self.ask,
+                                             verify_on=self.verify_on, verify_command=self.verify_command,
                                              terminal=self.terminal, web=self.reader, install=self.installer,
-                                             extend=self.ask_extend, search=self.searcher, nav=self.nav)
+                                             extend=self.ask_extend, search=self.searcher, nav=self.nav,
+                                             versions=self.versions)
             else:
                 result = flows.run_agent(task, ws, provider, history, open_file, self.translator,
                                          on_progress=self.progress.emit, should_stop=lambda: self.cancel,
                                          roster=self.roster, review_on=self.review_on, analyze_on=self.analyze_on,
+                                         verify_on=self.verify_on, verify_command=self.verify_command,
                                          ask=self.ask, terminal=self.terminal, web=self.reader,
                                          install=self.installer, extend=self.ask_extend, search=self.searcher,
-                                         nav=self.nav)
-            self.done.emit(result)
+                                         nav=self.nav, versions=self.versions)
         except Exception as e:  # доступ закрыли по ходу работы, сеть, формат ответа
-            self.failed.emit(f"{type(e).__name__}: {e}")
+            error = f"{type(e).__name__}: {e}"
         finally:
+            for p in self.providers():
+                p.set_progress(None)
             if self.terminal is not None:
                 self.terminal.close()
             self.nav.close()
+        # сигнал только после уборки: окно по нему отпускает поток, а Qt аварийно завершает программу,
+        # если поток уничтожен, пока он ещё работает
+        if error is not None:
+            self.failed.emit(error)
+        else:
+            self.done.emit(result)
 
 
 class MainWindow(QMainWindow):
@@ -131,6 +158,7 @@ class MainWindow(QMainWindow):
         self.conductor_on = bool(settings.get_user().get("conductor", True))
         self.review_on = bool(settings.get_user().get("review", True))
         self.analyze_on = bool(settings.get_user().get("analyze", True))
+        self.verify_on = bool(settings.get_user().get("verify", True))
         self.analysis_notes_shown: set[str] = set()
         self.journal_on = bool(settings.get_user().get("journal", True))
         self.last_journal: list = []   # места последних правок ИИ (журнал правок)
@@ -150,6 +178,7 @@ class MainWindow(QMainWindow):
         self.req_doc: Doc | None = None  # вкладка, из которой ушёл запрос
         self.check_worker: Worker | None = None
         self.note_workers: list[Worker] = []
+        self._retired: list[QThread] = []  # потоки, которые окно уже отпустило, а они ещё дорабатывают
         self.agent_provider = None
         self.translate_on = bool(settings.get_user().get("translate", True))
         self.check_cfg: dict = {}  # настройки проверки для открытого проекта
@@ -280,6 +309,7 @@ class MainWindow(QMainWindow):
         self.action(m, "С подтверждением (confirm)", lambda: self.mark("confirm"), "Ctrl+3")
         self.action(m, "Только интерфейс (interface)", lambda: self.mark("interface"), "Ctrl+5")
         self.action(m, "Объяснить ИИ (explain)", lambda: self.mark("explain"), "Ctrl+4")
+        self.action(m, "Отметка для себя (ИИ не видит)", lambda: self.human_mark(), "Ctrl+6")
         self.action(m, "Заметка к зоне...", lambda: self.edit_note(*self.block_range()), "Ctrl+Shift+N")
         self.action(m, "Снять метку", self.unmark, "Ctrl+0")
         self.action(m, "Найти секреты...", self.find_secrets, "Ctrl+Shift+K")
@@ -321,6 +351,9 @@ class MainWindow(QMainWindow):
         self.act_analyze = self.action(ai, "Статанализ после правок (ruff, mypy, bandit, eslint, tsc)", self.toggle_analyze)
         self.act_analyze.setCheckable(True)
         self.act_analyze.setChecked(self.analyze_on)
+        self.act_verify = self.action(ai, "Прогонять тесты после работы ИИ, пока не позеленеют", self.toggle_verify)
+        self.act_verify.setCheckable(True)
+        self.act_verify.setChecked(self.verify_on)
         self.act_review = self.action(ai, "Проверка безопасности после правок", self.toggle_review)
         self.act_review.setCheckable(True)
         self.refresh_review_action()
@@ -420,7 +453,51 @@ class MainWindow(QMainWindow):
         self.refresh_access()
         if not fresh:
             self.statusBar().showMessage("файл менялся вне редактора - зоны могли сместиться", 8000)
+        found = copies.find(text, doc.marks.items, self.copies_index(path), doc.marks.allowed)
+        if found:
+            self.resolve_copies(doc, found)
         return doc
+
+    def copies_index(self, path: Path | None) -> copies.Index:
+        """Отпечатки закрытого кода в открытой папке (или рядом с файлом, если папка не открыта)."""
+        root = self.tree.root or (path.parent if path else None)
+        return copies.build(root, SKIP_DIRS) if root is not None else copies.Index()
+
+    def stray_regions(self, path: Path | None, text: str, regions, allowed=()) -> list[guard.Region]:
+        """Закрытый код из других файлов, попавший сюда без своих зон: модели его не отдаём."""
+        return copies.regions(copies.find(text, regions, self.copies_index(path), allowed))
+
+    def resolve_copies(self, doc: Doc, found: list[copies.Match]):
+        answer = self.ask_copies(doc.name, found)
+        if answer == "close":
+            for m in found:
+                doc.marks.add(m.level, m.start, m.end)
+            self.say(f"{doc.name}: зоны возвращены ({len(found)})")
+        elif answer == "open":
+            doc.marks.allowed += [m.id for m in found if m.id not in doc.marks.allowed]
+            self.say(f"{doc.name}: закрытый код оставлен открытым для ИИ по твоему решению")
+        else:
+            self.say(f"{doc.name}: закрытый код без зон пока скрыт от ИИ; реши, когда будет время (переоткрой файл)")
+        doc.paint()
+
+    def ask_copies(self, name: str, found: list[copies.Match]) -> str:
+        """close, open или later."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Закрытый код без зон")
+        box.setText(f"В {name} есть код, который был закрыт от ИИ, но зон на нём сейчас нет.")
+        places = ", ".join(f"строки {m.start + 1}-{m.end + 1} ({m.level})" for m in found[:8])
+        box.setInformativeText(
+            f"Где: {places}{' ...' if len(found) > 8 else ''}.\n\n"
+            "Так бывает, если файл переименовали или скопировали мимо редактора (mv, git mv, проводник): "
+            "зоны лежат в файле .aimarks.json рядом со старым именем.\n\n"
+            "Пока ты не решишь, эти строки модели не уходят.")
+        close = box.addButton("Закрыть снова", QMessageBox.ButtonRole.AcceptRole)
+        keep = box.addButton("Оставить открытым для ИИ", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("Решить потом", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(close)
+        box.exec()
+        return {close: "close", keep: "open"}.get(box.clickedButton(), "later")
 
     def paint_regions(self):
         self.doc.paint()
@@ -459,11 +536,32 @@ class MainWindow(QMainWindow):
             self.add_doc()
         self.refresh_access()
 
+    def retire(self, thread):
+        """Отпускает поток, не роняя программу: пока он работает, ссылка на него остаётся у окна.
+        Qt аварийно завершает процесс, если объект потока уничтожен до конца его работы."""
+        if thread is None or not thread.isRunning():
+            return
+        self._retired.append(thread)
+        thread.finished.connect(lambda t=thread: self._retired.remove(t) if t in self._retired else None)
+
+    def stop_threads(self, timeout_ms: int = 4000):
+        """При закрытии окна: просим агента остановиться и ждём потоки. Зависший (например, в сети) прерываем:
+        программа всё равно завершается, а оставить его живым значит упасть при выходе."""
+        threads = [t for t in (self.worker, self.check_worker, *self.note_workers, *self._retired) if t is not None]
+        for t in threads:
+            if isinstance(t, AgentWorker):
+                t.cancel = True
+        for t in threads:
+            if t.isRunning() and not t.wait(timeout_ms):
+                t.terminate()
+                t.wait(1000)
+
     def closeEvent(self, event):
         for doc in list(self.docs):
             if not self.confirm_discard(doc):
                 event.ignore()
                 return
+        self.stop_threads()
         event.accept()
 
     @staticmethod
@@ -729,6 +827,7 @@ class MainWindow(QMainWindow):
         self.run_check()
 
     def end_check(self):
+        self.retire(self.check_worker)
         self.check_worker = None
         if not self.worker:
             self.chat.set_busy(False)
@@ -750,8 +849,9 @@ class MainWindow(QMainWindow):
 
     # --- предпросмотр и журнал ---
     def current_input(self) -> orchestrator.FileInput:
-        return orchestrator.FileInput(self.path, self.editor.toPlainText(), list(self.marks.items),
-                                      self.tree.root)
+        text, regions = self.editor.toPlainText(), list(self.marks.items)
+        regions += self.stray_regions(self.path, text, regions, self.marks.allowed)
+        return orchestrator.FileInput(self.path, text, regions, self.tree.root)
 
     def context_inputs(self) -> list[orchestrator.FileInput]:
         """Контекстные файлы со своими зонами. Секреты в них скрываются всегда."""
@@ -763,7 +863,7 @@ class MainWindow(QMainWindow):
                 continue  # открытый файл и так идёт как основной
             live = next((d for d in self.docs if d.path and Path(os.path.realpath(d.path)) == path), None)
             if live is not None:  # файл открыт во вкладке: берём его текст и зоны, даже несохранённые
-                text, regions = live.text(), list(live.marks.items)
+                text, regions, allowed = live.text(), list(live.marks.items), live.marks.allowed
             else:
                 try:
                     text = path.read_text(encoding="utf-8")
@@ -771,7 +871,8 @@ class MainWindow(QMainWindow):
                     continue
                 marks = Marks()
                 marks.load(path, text)
-                regions = list(marks.items)
+                regions, allowed = list(marks.items), marks.allowed
+            regions += self.stray_regions(path, text, regions, allowed)
             n = len(text.split("\n"))
             for a, b in secrets_scan.to_ranges(secrets_scan.uncovered(secrets_scan.scan(text), regions, n)):
                 regions.append(guard.Region("hidden", a, b))
@@ -938,6 +1039,7 @@ class MainWindow(QMainWindow):
 
         def done(res):
             self.note_workers.remove(worker)
+            self.retire(worker)
             zone = doc.marks.zone_at(line, ("interface", "hidden")) if doc in self.docs else None
             if zone is None or zone.note != text:
                 return  # пока переводилось, заметку поменяли или зону сняли
@@ -948,12 +1050,34 @@ class MainWindow(QMainWindow):
             elif res.note not in ("перевод не нужен", "переводить нечего"):
                 self.say(f"заметка не переведена: {res.note}. Уйдёт как написана")
         worker.done.connect(done)
-        worker.failed.connect(lambda err: (self.note_workers.remove(worker), self.say(f"заметка не переведена: {err}")))
+        worker.failed.connect(lambda err: (self.note_workers.remove(worker), self.retire(worker), self.say(f"заметка не переведена: {err}")))
         worker.start()
+
+    def human_mark(self, a: int | None = None, b: int | None = None):
+        """Отметка для себя: текст видит только человек, в запросы к моделям она не попадает."""
+        if a is None:
+            a, b = self.block_range()
+        d = self.doc
+        current = next((m for n in range(a, b + 1) if (m := d.marks.human_at(n))), None)
+        text, ok = QInputDialog.getText(
+            self, "Отметка для себя",
+            f"Заметка к строкам {a + 1}-{b + 1}. Модель её не увидит: она хранится только у тебя, рядом с файлом.",
+            text=current.note if current else "")
+        if not ok:
+            return
+        d.marks.add_human(a, b, text)
+        d.paint()
 
     def on_gutter_mark(self, action: str, a: int, b: int):
         if action == "note":
             self.edit_note(a, b)
+            return
+        if action == "human":
+            self.human_mark(a, b)
+            return
+        if action == "unhuman":
+            self.marks.clear_human(a, b)
+            self.paint_regions()
             return
         if action == "unmark":
             self.marks.clear(a, b)
@@ -1112,21 +1236,7 @@ class MainWindow(QMainWindow):
 
     def ask_outbound(self, findings: list[outbound.Finding], model: str) -> str:
         """mask, send или cancel."""
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Icon.Warning)
-        box.setWindowTitle("Фильтр исходящего")
-        box.setText(f"В запросе к {model} найдено то, что лучше не отправлять: {len(findings)}.")
-        lines = [f"• {f.kind}: {f.preview()}" for f in findings[:10]]
-        if len(findings) > 10:
-            lines.append(f"... и ещё {len(findings) - 10}")
-        box.setInformativeText("\n".join(lines) + "\n\n«Скрыть» заменит это метками; в ответе модели "
-                               "метки вернутся обратно. Решение запомнится до нового чата.")
-        hide = box.addButton("Скрыть и отправить", QMessageBox.ButtonRole.AcceptRole)
-        send = box.addButton("Отправить как есть", QMessageBox.ButtonRole.DestructiveRole)
-        box.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
-        box.setDefaultButton(hide)
-        box.exec()
-        return {hide: "mask", send: "send"}.get(box.clickedButton(), "cancel")
+        return dialogs.ask_outbound(self, findings, model)
 
     def log_filter(self, entry: dict):
         """В журнал отправок: что нашёл фильтр и что решил человек. Самих значений там нет."""
@@ -1252,6 +1362,10 @@ class MainWindow(QMainWindow):
             self.web_sites = sorted({s.strip().lower() for s in text.split("\n") if s.strip()})
             settings.set_user(web_sites=self.web_sites)
             self.say(f"сайтов без вопроса: {len(self.web_sites)}")
+
+    def make_versions(self):
+        """Поиск версий пакетов в PyPI и npm: идёт в интернет, поэтому подчиняется тому же выключателю, что и страницы."""
+        return versions.lookup if self.web_on else None
 
     def make_searcher(self) -> "search.Search | None":
         key = search.load_key()
@@ -1476,6 +1590,12 @@ class MainWindow(QMainWindow):
         self.tabs.setTabToolTip(i, "Места, где ИИ что-то написал, от самых больших к самым маленьким")
         self.tabs.setCurrentIndex(i)
 
+    def toggle_verify(self):
+        self.verify_on = self.act_verify.isChecked()
+        settings.set_user(verify=self.verify_on)
+        self.say("после работы ИИ редактор сам запускает тесты (в песочнице, с твоего разрешения) и возвращает ИИ красное, "
+                 "пока не позеленеет" if self.verify_on else "проверка тестами после работы ИИ выключена")
+
     def toggle_analyze(self):
         self.analyze_on = self.act_analyze.isChecked()
         settings.set_user(analyze=self.analyze_on)
@@ -1510,6 +1630,8 @@ class MainWindow(QMainWindow):
             self.say(f"статанализ ({names}): осталось новых замечаний {len(report.remaining)}")
             for i in report.remaining:
                 self.say(f"  [{i.tool} {i.code}] {i.file}:{i.line} - {i.message}")
+            if report.stalled:
+                self.say(f"статанализ: остановлен: {report.stalled}")
         ignored = sum(r.ignored for r in report.rounds)
         if ignored:
             self.say(f"статанализ: замечаний в закрытых зонах пропущено: {ignored}")
@@ -1529,7 +1651,7 @@ class MainWindow(QMainWindow):
         settings.set_user(review=self.review_on)
         r = self.roster.reviewer()
         self.say((f"проверка безопасности включена: {r.key} читает все правки до применения, серьёзные замечания "
-                  "возвращаются автору (не больше двух кругов)") if self.review_on and r else "проверка безопасности выключена")
+                  "возвращаются автору, пока замечаний нет, до 5 кругов; потом статанализ)") if self.review_on and r else "проверка безопасности выключена")
 
     def show_review(self, report):
         """Короткий отчёт проверяющего в чат. Закрытый от него код называется явно."""
@@ -1547,6 +1669,8 @@ class MainWindow(QMainWindow):
                      f"кругов исправления: {report.fixed_rounds}")
             for f in report.remaining:
                 self.say(f"  [{f.severity}] {f.file}" + (f":{f.line}" if f.line else "") + f" - {f.issue}")
+        if report.stalled and report.remaining:
+            self.say(f"безопасность ({report.reviewer}): цикл остановлен: {report.stalled}")
         for rnd in report.rounds:
             for note in rnd.fix_notes:
                 self.say(f"ответ автора: {note}")
@@ -1569,7 +1693,7 @@ class MainWindow(QMainWindow):
     # --- агент по проекту ---
     def live_files(self) -> dict:
         """Открытые вкладки: их текст и зоны важнее диска, даже несохранённые."""
-        return {d.path: (d.text(), list(d.marks.items)) for d in self.docs if d.path}
+        return {d.path: (d.text(), list(d.marks.items), list(d.marks.allowed)) for d in self.docs if d.path}
 
     def make_workspace(self, log: bool = True) -> Workspace:
         return Workspace(self.tree.root, self.live_files(), self.providers["strong"].name, log_enabled=log)
@@ -1583,21 +1707,33 @@ class MainWindow(QMainWindow):
             self.chat.input.setPlainText(task)
             return
         self.sent_task, self.sent_source = task, self.path
-        provider = self.conductor_provider if self.conductor_on else self.providers["strong"]
+        discuss = self.chat.discuss
+        self.agent_discuss = discuss
+        conduct = self.conductor_on and not discuss and self.roster.can_split()
+        if self.conductor_on and not discuss and not conduct:
+            self.say("дирижёр пропущен: исполнитель один, делить шаги не между кем")
+        provider = self.conductor_provider if conduct else self.providers["strong"]
         self.ask_btn.setEnabled(False)
         self.explain_btn.setEnabled(False)
-        self.chat.set_busy(True, "Дирижёр планирует..." if self.conductor_on else "Агент работает...", can_stop=True)
+        self.chat.set_busy(True, "ИИ отвечает..." if discuss else
+                           "Дирижёр планирует..." if conduct else "Агент работает...", can_stop=True)
         self.agent_provider = provider
         self.watch_task(task)
-        self.worker = AgentWorker(task, self.make_workspace(), self.gate.wrap(provider), list(self.history), self.path,
-                                  self.active_translator(), self.gate.wrap_roster(self.roster), self.conductor_on,
-                                  self.review_active(), self.analyze_on,
-                                  self.decide_command if self.terminal_active() else None, self.make_reader(),
-                                  self.decide_install if self.install_on else None, self.decide_extend,
-                                  self.make_searcher())
+        ws = self.make_workspace()
+        ws.read_only = discuss
+        self.agent_ws = ws  # после работы по нему видно, на какие закрытые места агент натыкался
+        self.worker = AgentWorker(task, ws, self.gate.wrap(provider), list(self.history), self.path,
+                                  self.active_translator(), self.gate.wrap_roster(self.roster),
+                                  conduct,
+                                  self.review_active() and not discuss, self.analyze_on and not discuss,
+                                  self.decide_command if self.terminal_active() and not discuss else None,
+                                  self.make_reader(), self.decide_install if self.install_on and not discuss else None,
+                                  self.decide_extend, self.make_searcher(), discuss, self.make_versions(),
+                                  self.verify_on and not discuss, self.check_cfg.get("test_command") or "")
         self.worker.progress.connect(self.say)
         self.worker.question.connect(self.on_question)
         self.worker.command_done.connect(self.show_command)
+        self.worker.typing.connect(self.on_typing)
         self.worker.done.connect(self.on_agent_done)
         self.worker.failed.connect(self.on_fail)
         self.worker.start()
@@ -1619,7 +1755,7 @@ class MainWindow(QMainWindow):
         if not text or worker is None:
             return
         self.chat.add_user(text)
-        self.chat.input.setPlaceholderText(ChatPanel.PLACEHOLDER)
+        self.chat.update_placeholder()
         self.watch_task(text)  # ответ уходит модели: фильтр проверит и его
         self.ask_btn.setEnabled(False)
         self.chat.set_busy(True, "Агент работает...", can_stop=True)
@@ -1640,7 +1776,9 @@ class MainWindow(QMainWindow):
     def on_agent_done(self, res: agent.AgentResult):
         self.finish()
         meta = f"{self.agent_provider.name} · агент · шагов: {res.steps}"
-        if isinstance(res, conductor.ConductResult) and res.plan is not None:
+        if getattr(self, "agent_discuss", False):
+            meta = f"{self.agent_provider.name} · обсуждение (правки выключены)"
+        elif isinstance(res, conductor.ConductResult) and res.plan is not None:
             workers = ", ".join(dict.fromkeys(t.worker for t in res.plan.tasks))
             meta = f"{self.agent_provider.name} · дирижёр · шагов плана: {len(res.plan.tasks)} ({workers}) · запросов: {res.steps}"
         spent = agent.usage_text(res.usage, res.sent)
@@ -1649,6 +1787,12 @@ class MainWindow(QMainWindow):
         if res.stopped:
             meta += f" · {res.stopped}"
         self.chat.add_ai(res.text or "Готово.", meta)
+        failed = self.show_failed_steps(res)
+        if res.from_model and not res.calls and not res.changes and not failed and not getattr(self, "agent_discuss", False):
+            self.say("ИИ ответил, не вызвав ни одного инструмента: проект он не смотрел и правок не предлагал. "
+                     "Если ждали правок, модель могла не удержать формат @@tool: уточни задачу или возьми модель посильнее")
+        self.show_verification(res.verification)
+        self.show_closed_seen()
         self.show_notes(res.notes)
         self.show_analysis(res.analysis)
         self.show_review(res.review)
@@ -1666,6 +1810,67 @@ class MainWindow(QMainWindow):
                 (res.analysis, res.review)))
         if res.changes and outcome.startswith("edits applied: ") and not outcome.startswith("edits applied: none") and self.check_cfg.get("auto") and self.check_cfg.get("test_command"):
             QTimer.singleShot(0, self.run_check_after_ai)
+
+    def on_typing(self, chars: int):
+        """Модель пишет ответ: на ожидании видно, что редактор не завис."""
+        if self.worker is not None and self.waiting is None:
+            self.chat.busy_label.setText(f"ИИ пишет ответ… {chars} симв.")
+
+    @staticmethod
+    def failure_reason(error: str) -> str:
+        """Ошибка шага человеческим языком: что случилось и что с этим делать."""
+        low = error.lower()
+        if connections.is_quota_error(low):
+            return ("на ключе или счёте сервиса моделей закончились деньги или лимит. Пополните баланс или поднимите "
+                    "лимит ключа у сервиса и отправьте задачу ещё раз")
+        if "timeout" in low or "timed out" in low:
+            return "модель не успела ответить: связь молчала слишком долго. Повторите задачу, а большую разбейте на части"
+        if "urlerror" in low or "resolution" in low or "connection" in low:
+            return "нет связи с сервером модели (сеть, DNS, VPN). Повторите, когда связь вернётся"
+        if "429" in low or "overloaded" in low or "529" in low:
+            return "сервер модели перегружен или лимит запросов исчерпан. Подождите и повторите"
+        if "401" in low or "403" in low:
+            return "ключ не принят или доступ закрыт: проверьте подключение (ИИ → Подключения ИИ...)"
+        return error[:200]
+
+    def show_failed_steps(self, res) -> bool:
+        """Шаги плана, которые не выполнились: говорим прямо, почему, а не списываем на формат. True - были."""
+        failed = [r for r in getattr(res, "results", []) if r.status == "failed"]
+        for r in failed:
+            self.say(f"шаг {r.task.id} ({r.task.worker}) не выполнен: {self.failure_reason(r.text)}")
+        if failed:
+            self.say("то, что другие шаги уже успели предложить, показано на проверку как обычно; задачу можно отправить ещё раз")
+        return bool(failed)
+
+    def show_verification(self, report):
+        """Итог запуска тестов редактором: факт, а не слова модели. Красное говорим громко."""
+        if report is None:
+            return
+        if report.skipped:
+            self.say(f"проверка тестами не шла: {report.skipped}")
+            return
+        if report.green is None:
+            return
+        how = f"«{report.command}»: запусков {report.runs}" + (f", исправлений по красному {report.fixes}" if report.fixes else "")
+        if report.green:
+            self.say(f"проверка зелёная ({how})")
+        else:
+            tail = [l for l in report.output.strip().split("\n") if l.strip()][-3:]
+            self.say(f"ПРОВЕРКА КРАСНАЯ ({how}). " + (report.stalled + ". " if report.stalled else "")
+                     + "Не верь слову «готово» выше: " + " | ".join(t.strip()[:110] for t in tail))
+        for note in report.notes:
+            self.say("проверка: " + note)
+
+    def show_closed_seen(self):
+        """Агент упирался в закрытый код: человек должен знать, что ответ про эти места неполный, а не «там пусто»."""
+        ws = getattr(self, "agent_ws", None)
+        seen = getattr(ws, "closed_seen", None)
+        if not seen:
+            return
+        places = ", ".join(f"{ws.rel(p)} ({n} стр.)" for p, n in sorted(seen.items())[:8])
+        self.say(f"ИИ видел не всё: от него закрыто {places}. Ответ про эти места может быть неполным: "
+                 "он видел только заглушки (у interface ещё имена и комментарии)")
+        self.agent_ws = None
 
     @staticmethod
     def review_notes(report, name: str) -> list[str]:
@@ -1757,6 +1962,7 @@ class MainWindow(QMainWindow):
     def set_doc_text(doc, text: str, regions):
         """Весь текст вкладки одним шагом отмены (Ctrl+Z вернёт прежний вместе с зонами)."""
         doc.marks.remember(doc.text())
+        before = doc.text()
         doc.silent = True
         cur = doc.editor.textCursor()
         cur.beginEditBlock()
@@ -1766,6 +1972,7 @@ class MainWindow(QMainWindow):
         doc.silent = False
         doc.block_count = doc.editor.blockCount()
         doc.marks.items = list(regions)
+        doc.marks.remap_human(before, text)
         doc.paint()
 
     def doc_for(self, path: Path):
@@ -1890,9 +2097,10 @@ class MainWindow(QMainWindow):
                         self.context_inputs(), self.tree.root, on_done=self.on_explain)
 
     def finish(self):
+        self.retire(self.worker)
         self.worker = None
         self.waiting = None
-        self.chat.input.setPlaceholderText(ChatPanel.PLACEHOLDER)
+        self.chat.update_placeholder()
         self.chat.set_busy(False)
         self.refresh_access()
 
@@ -1960,6 +2168,7 @@ class MainWindow(QMainWindow):
         d.silent = False
         d.block_count = d.editor.blockCount()
         d.marks.items = guard.remap(self.base_regions, self.base_text, res.new_text)
+        d.marks.remap_human(self.base_text, res.new_text)
         d.paint()
         self.say("правка применена")
         self.show_journal(self.build_journal([(d.name, self.base_text, res.new_text, res.provider.name,

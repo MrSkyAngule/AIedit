@@ -22,6 +22,11 @@ def _span(h: Hunk) -> str:
     return f"{h.start}" if h.start == h.end else f"{h.start}-{h.end}"
 
 
+def ai_author(author: str) -> str:
+    """В журнале видно, что место написал ИИ, а не человек."""
+    return f"ИИ · {author}" if author else ""
+
+
 class JournalView(QWidget):
     def __init__(self, parent, hunks: list[Hunk], on_goto):
         super().__init__(parent)
@@ -46,7 +51,7 @@ class JournalView(QWidget):
             idx = by_file[name]
             added, removed = sum(self.hunks[i].added for i in idx), sum(self.hunks[i].removed for i in idx)
             remarks = sum(len(self.hunks[i].remarks) for i in idx)
-            authors = ", ".join(dict.fromkeys(self.hunks[i].author for i in idx if self.hunks[i].author))
+            authors = ", ".join(dict.fromkeys(ai_author(self.hunks[i].author) for i in idx if self.hunks[i].author))
             top = QTreeWidgetItem([name, f"+{added} -{removed}", f"{len(idx)} мест", "", authors, str(remarks) if remarks else ""])
             top.setFont(0, self._bold())
             top.setToolTip(0, "Клик откроет файл в отдельной вкладке на самой большой правке")
@@ -55,7 +60,7 @@ class JournalView(QWidget):
             for i in idx:
                 h = self.hunks[i]
                 child = QTreeWidgetItem([f"строки {_span(h)}" if h.start != h.end else f"строка {h.start}",
-                                         f"+{h.added} -{h.removed}", KINDS[h.kind], h.preview, h.author,
+                                         f"+{h.added} -{h.removed}", KINDS[h.kind], h.preview, ai_author(h.author),
                                          str(len(h.remarks)) if h.remarks else ""])
                 child.setBackground(1, QColor(255, 170, 0, 30 + int(130 * h.size / biggest)))  # чем больше, тем ярче
                 child.setToolTip(1, f"{KINDS[h.kind]}, строк затронуто: {h.size}")
@@ -141,6 +146,6 @@ class JournalView(QWidget):
             return
         h = self.hunks[i]
         head = (f"<p><b>{html.escape(h.file)}</b>, строки {h.start}-{h.end}, {KINDS[h.kind]}"
-                + (f", {html.escape(h.author)}" if h.author else "") + "</p>")
+                + (f", {html.escape(ai_author(h.author))}" if h.author else "") + "</p>")
         notes = "".join(f'<p style="color:#b42318;">{html.escape(r)}</p>' for r in h.remarks)
         self.detail.setHtml(head + notes + diff_to_html(h.diff))

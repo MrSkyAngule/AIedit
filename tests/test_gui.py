@@ -5,6 +5,9 @@ import re
 import shlex
 import sys
 import tempfile
+import urllib.error
+import dataclasses
+import time
 import unittest
 from pathlib import Path
 
@@ -15,8 +18,8 @@ except ImportError:  # нет Qt - тесты окна пропускаем
     QApplication = None
 
 if QApplication is not None:
-    from aiedit import chatstore, policy, sendlog, settings, web
-    from aiedit.marks import text_hash
+    from aiedit import chatstore, guard, outbound, policy, sendlog, settings, web
+    from aiedit.marks import Marks, text_hash
     from aiedit.app import MainWindow
     from aiedit.providers import Provider
     from aiedit.syntax import Highlighter
@@ -80,6 +83,7 @@ class GuiCase(unittest.TestCase):
         self.windows.append(w)
         w.journal_on = False  # окна журнала в посторонних тестах не нужны
         w.analyze_on = False  # настоящие анализаторы в посторонних тестах не запускаем
+        w.verify_on = False  # и тесты после работы ИИ тоже: они просят разрешения у человека в диалоге
         w.conductor_on = False  # эти тесты проверяют прямой режим агента; дирижёр - в ConductorGuiTest
         w.tree.set_root(self.root)
         w.acknowledged.add(self.root)
@@ -425,6 +429,102 @@ class AgentGuiTest(GuiCase):
         self.assertIn("ai", kinds)
         self.assertIn("читаю b.py", [m[1] for m in w.chat.messages if m[0] == "system"])
 
+    def test_discuss_mode_answers_without_changing_anything(self):
+        w, prov = self.agent([edit("b.py", "y = 2", "y = 3"), "Можно так, но решать вам."])
+        shown = []
+        w.review_changes = lambda items: shown.append(items) or [True] * len(items)
+        w.chat.discuss_box.setChecked(True)
+        w.ask_ai("как лучше поменять y?")
+        self.wait(w)
+        self.assertEqual((self.root / "b.py").read_text(), "y = 2\n")
+        self.assertEqual(shown, [])  # окно проверки правок даже не открывалось
+        self.assertIn("Mode: discuss.", prov.systems[0])
+        ai = [m for m in w.chat.messages if m[0] == "ai"][-1]
+        self.assertIn("обсуждение", ai[2])
+        self.assertIn("Можно так", ai[1])
+
+    def test_discuss_mode_off_means_normal_agent(self):
+        w, prov = self.agent([edit("b.py", "y = 2", "y = 3"), "готово"])
+        self.assertFalse(w.chat.discuss)
+        w.ask_ai("поправь")
+        self.wait(w)
+        self.assertEqual((self.root / "b.py").read_text(), "y = 3\n")
+        self.assertIn("Mode: agent.", prov.systems[0])
+
+    def test_no_tools_called_is_said_plainly(self):
+        w, prov = self.agent(["Что именно вставить?"])
+        w.ask_ai("вставь в код")
+        self.wait(w)
+        said = " ".join(m[1] for m in w.chat.messages if m[0] == "system")
+        self.assertIn("не вызвав ни одного инструмента", said)
+
+    def test_no_such_notice_when_tools_were_used_or_in_discuss_mode(self):
+        w, prov = self.agent([call("read_file", path="b.py"), "Это просто переменная."])
+        w.ask_ai("что в b.py?")
+        self.wait(w)
+        self.assertNotIn("не вызвав ни одного инструмента", " ".join(m[1] for m in w.chat.messages if m[0] == "system"))
+        w, prov = self.agent(["Можно так."])
+        w.chat.discuss_box.setChecked(True)
+        w.ask_ai("как лучше?")
+        self.wait(w)
+        self.assertNotIn("не вызвав ни одного инструмента", " ".join(m[1] for m in w.chat.messages if m[0] == "system"))
+
+    def test_conductor_is_skipped_with_a_single_builder(self):
+        w, prov = self.agent([edit("b.py", "y = 2", "y = 3"), "готово"])
+        from aiedit.roster import Roster, Worker
+        w.roster = Roster([Worker("solo", prov, "", 0, 0, "mid")])
+        w.providers = w.roster.providers()
+        w.conductor_on = True
+        w.conductor_provider = Script(["@@plan\nsummary: s\n@@end"])  # если его позовут, тест увидит
+        w.ask_ai("поправь")
+        self.wait(w)
+        self.assertEqual(w.conductor_provider.seen, [])
+        self.assertIn("дирижёр пропущен", " ".join(m[1] for m in w.chat.messages if m[0] == "system"))
+        self.assertEqual((self.root / "b.py").read_text(), "y = 3\n")
+
+    def test_human_mark_is_saved_and_never_sent_to_any_model(self):
+        note = "ТОЛЬКО_ДЛЯ_ЧЕЛОВЕКА_секрет_заметки"
+        w, prov = self.agent([call("read_file", path="a.py"), "это функция f", "это тоже просто код"])
+        w.doc.marks.add_human(0, 1, note)
+        w.doc.paint()
+        self.assertIn(note, (self.root / "a.py.aimarks.json").read_text())  # лежит рядом с файлом
+        w.ask_ai("что делает f?")  # агент по проекту
+        self.wait(w)
+        w.ask_file("а тут что?")  # режим вопроса по одному файлу
+        self.wait(w)
+        self.assertGreaterEqual(len(prov.seen), 3)  # оба запроса действительно ушли к модели
+        self.assertNotIn(note, prov.everything())
+        self.assertNotIn("ТОЛЬКО_ДЛЯ", " ".join(prov.systems))
+        self.assertNotIn(note, " ".join(m[1] for m in w.chat.messages))
+
+    def test_human_mark_survives_reopen_and_follows_an_ai_insert(self):
+        w, prov = self.agent([edit("a.py", "def f():", "import os\nimport sys\ndef f():"), "добавил импорты"])
+        w.doc.marks.add_human(3, 4, "проверить g")  # на def g
+        w.doc.paint()
+        w.ask_ai("добавь импорты")
+        self.wait(w)
+        self.assertEqual([(r.start, r.end, r.note) for r in w.doc.marks.human], [(5, 6, "проверить g")])
+        w.doc.save()
+        w2 = self.window("a.py")
+        self.assertEqual([(r.start, r.end, r.note) for r in w2.doc.marks.human], [(5, 6, "проверить g")])
+        self.assertEqual(w2.doc.editor.human[5].note, "проверить g")
+        w2.show()
+        self.assertFalse(w2.doc.editor.grab().isNull())  # полоса отметки рисуется без ошибок
+
+    def test_human_is_told_when_the_agent_ran_into_closed_code(self):
+        w, prov = self.agent([call("read_file", path="a.py"), "Вот что там."])
+        w.on_gutter_mark("interface", 3, 4)
+        w.ask_ai("что в a.py?")
+        self.wait(w)
+        said = " ".join(m[1] for m in w.chat.messages if m[0] == "system")
+        self.assertIn("ИИ видел не всё: от него закрыто a.py (2 стр.)", said)
+
+    def test_no_such_notice_when_nothing_was_closed(self):
+        w, prov = self.agent([call("read_file", path="b.py"), "Это y."])
+        w.ask_ai("что в b.py?")
+        self.wait(w)
+        self.assertNotIn("ИИ видел не всё", " ".join(m[1] for m in w.chat.messages if m[0] == "system"))
+
     def test_agent_can_create_file_and_zones_follow_open_tab(self):
         w, prov = self.agent(["@@tool create_file\npath: pkg/new.py\n@@content\nx = 1\n@@end", "создал"])
         w.on_gutter_mark("readonly", 3, 4)
@@ -560,6 +660,151 @@ class AgentGuiTest(GuiCase):
         w.ask_ai("добавь комментарий в начало")
         self.wait(w)
         self.assertIn("# [demo", w.editor.toPlainText().splitlines()[0])
+
+
+class ThreadSafetyTest(GuiCase):
+    """Qt аварийно завершает программу, если объект потока уничтожен, пока поток ещё работает."""
+
+    def test_agent_cleans_up_before_it_tells_the_window_it_is_done(self):
+        from unittest import mock
+        from aiedit import codenav
+        events = []
+        real_close, real_done = codenav.Navigator.close, MainWindow.on_agent_done
+
+        def close(nav):
+            time.sleep(0.15)  # закрытие языкового сервера и песочницы занимает время
+            events.append("cleanup")
+            real_close(nav)
+
+        def done(win, res):
+            events.append("done")
+            return real_done(win, res)
+        w = AgentGuiTest.agent(self, ["Привет."])[0]
+        with mock.patch.object(codenav.Navigator, "close", close), mock.patch.object(MainWindow, "on_agent_done", done):
+            w.review_changes = lambda items: [True] * len(items)
+            w.ask_ai("привет")
+            self.wait(w)
+        self.assertEqual(events, ["cleanup", "done"])
+
+    def test_released_thread_is_kept_until_it_really_stops(self):
+        from aiedit.qt import QThread
+
+        class Slow(QThread):
+            def run(self):
+                time.sleep(0.3)
+        w = self.window()
+        t = Slow()
+        t.start()
+        w.retire(t)
+        self.assertIn(t, w._retired)  # окно держит ссылку: поток ещё работает
+        t.wait()
+        for _ in range(5):
+            app.processEvents()
+        self.assertNotIn(t, w._retired)
+        w.retire(None)  # пустое и уже остановленное просто игнорируется
+        w.retire(t)
+        self.assertEqual(w._retired, [])
+
+    def test_closing_the_window_waits_for_running_threads(self):
+        from aiedit.qt import QThread
+        finished = []
+
+        class Slow(QThread):
+            def run(self):
+                time.sleep(0.3)
+                finished.append(True)
+        w = self.window()
+        t = Slow()
+        w.note_workers.append(t)
+        t.start()
+        w.stop_threads()
+        self.assertEqual(finished, [True])  # дождались, а не бросили
+        self.assertFalse(t.isRunning())
+        w.note_workers.clear()
+
+    def test_error_in_the_agent_is_reported_after_cleanup_too(self):
+        events = []
+        w = AgentGuiTest.agent(self, [])[0]
+        w.on_fail = lambda err: events.append(("fail", err))
+        from unittest import mock
+        with mock.patch("aiedit.flows.run_agent", side_effect=RuntimeError("boom")):
+            w.ask_ai("привет")
+            self.wait(w)
+        self.assertEqual(events, [("fail", "RuntimeError: boom")])
+
+
+class VersionLookupSwitchTest(GuiCase):
+    def test_lookup_follows_the_internet_switch(self):
+        from aiedit import versions
+        w = self.window("a.py")
+        w.web_on = True
+        self.assertIs(w.make_versions(), versions.lookup)
+        w.web_on = False
+        self.assertIsNone(w.make_versions())  # интернет для ИИ выключен: в реестры тоже не ходим
+
+    def test_agent_gets_the_lookup_and_uses_it(self):
+        w = self.window("a.py")
+        prov = Script(["@@tool package_version\nname: flask\n@@end", "Беру актуальную."])
+        w.providers = {"cheap": prov, "strong": prov}
+        w.web_on = True
+        from unittest import mock
+        with mock.patch("aiedit.versions.lookup", return_value="pypi Flask: latest stable 3.1.3") as lookup:
+            w.make_versions = lambda: lookup
+            w.ask_ai("сделай сайт на flask")
+            self.wait(w)
+        lookup.assert_called_once_with("flask")
+        self.assertIn("latest stable 3.1.3", prov.seen[1][-1]["content"])
+
+
+class VerificationNoticeTest(GuiCase):
+    def said(self, w):
+        return " | ".join(m[1] for m in w.chat.messages if m[0] == "system")
+
+    def test_green_result_is_stated_as_a_fact(self):
+        from aiedit.verify import VerifyReport
+        w = self.window("a.py")
+        w.show_verification(VerifyReport(command="python -m pytest -q", runs=3, fixes=2, green=True))
+        self.assertIn("проверка зелёная («python -m pytest -q»: запусков 3, исправлений по красному 2)", self.said(w))
+
+    def test_red_result_is_loud_and_shows_the_real_output(self):
+        from aiedit.verify import VerifyReport
+        w = self.window("a.py")
+        w.show_verification(VerifyReport(command="pytest", runs=4, fixes=3, green=False, stalled="та же ошибка повторилась",
+                                         output="...\nE   SyntaxError: bytes can only contain ASCII literal characters\n1 error in 0.09s",
+                                         notes=["число тестов уменьшилось с 40 до 12"]))
+        said = self.said(w)
+        self.assertIn("ПРОВЕРКА КРАСНАЯ", said)
+        self.assertIn("Не верь слову «готово»", said)
+        self.assertIn("SyntaxError: bytes can only contain ASCII", said)
+        self.assertIn("та же ошибка повторилась", said)
+        self.assertIn("число тестов уменьшилось с 40 до 12", said)
+
+    def test_skipped_and_missing_reports(self):
+        from aiedit.verify import VerifyReport
+        w = self.window("a.py")
+        w.show_verification(None)
+        w.show_verification(VerifyReport(skipped="The user declined to run this command"))
+        self.assertIn("проверка тестами не шла: The user declined", self.said(w))
+        self.assertNotIn("красная", self.said(w))
+
+    def test_switch_is_saved_and_reaches_the_worker_only_when_on(self):
+        w = self.window("a.py")
+        w.act_verify.setChecked(False)
+        w.toggle_verify()
+        self.assertFalse(w.verify_on)
+        self.assertIn("выключена", self.said(w))
+        w.act_verify.setChecked(True)
+        w.toggle_verify()
+        self.assertTrue(w.verify_on)
+        self.assertIn("сам запускает тесты", self.said(w))
+
+    def test_configured_test_command_goes_to_the_worker(self):
+        w = AgentGuiTest.agent(self, ["Привет."])[0]
+        w.verify_on = True
+        w.check_cfg = {"test_command": "make check"}
+        w.ask_ai("привет")
+        self.assertEqual((w.worker.verify_on, w.worker.verify_command), (True, "make check"))
+        self.wait(w)
 
 
 class TranslateGuiTest(GuiCase):
@@ -795,6 +1040,73 @@ class ConductorGuiTest(GuiCase):
         self.assertIn("остановлено", w.chat.history.toPlainText())
 
 
+class FailureNoticesTest(GuiCase):
+    """Когда шаг не выполнился (таймаут, сеть), редактор говорит об этом прямо и не сваливает вину на формат."""
+    PLAN = ConductorGuiTest.PLAN
+    conduct = ConductorGuiTest.conduct
+
+    def failing_window(self, error):
+        class Failing(Script):
+            def complete(self, system, messages):
+                raise error
+        w = self.conduct()
+        self.workers["haiku"], self.workers["opus"] = Failing([]), Failing([])
+        w.roster = type(w.roster)([dataclasses.replace(wk, provider=self.workers[wk.key]) for wk in w.roster.workers.values()])
+        return w
+
+    def said(self, w):
+        return " ".join(m[1] for m in w.chat.messages if m[0] == "system")
+
+    def test_timeout_is_explained_and_not_blamed_on_the_tool_format(self):
+        w = self.failing_window(TimeoutError("The read operation timed out"))
+        w.ask_ai("поправь")
+        self.wait(w)
+        said = self.said(w)
+        self.assertIn("не выполнен: модель не успела ответить", said)
+        self.assertIn("задачу можно отправить ещё раз", said)
+        self.assertNotIn("не вызвав ни одного инструмента", said)  # прежняя ложная подсказка
+
+    def test_network_failure_has_its_own_wording(self):
+        w = self.failing_window(urllib.error.URLError("Временный сбой в разрешении имен"))
+        w.ask_ai("поправь")
+        self.wait(w)
+        self.assertIn("нет связи с сервером модели", self.said(w))
+
+    def test_reasons_are_human(self):
+        reason = MainWindow.failure_reason
+        self.assertIn("не успела ответить", reason("TimeoutError: timed out"))
+        self.assertIn("перегружен", reason("HTTPError: HTTP Error 529: overloaded"))
+        self.assertIn("ключ не принят", reason("HTTPError: HTTP Error 401: Unauthorized"))
+        self.assertEqual(reason("ValueError: странное"), "ValueError: странное")
+        self.assertIn("закончились деньги или лимит", reason("HTTPError: HTTP Error 403: Forbidden: insufficient_user_quota"))
+
+
+class TypingIndicatorTest(GuiCase):
+    def test_streamed_text_shows_progress_while_waiting(self):
+        seen = []
+
+        class Streaming(Script):
+            def complete(self, system, messages):
+                if self.progress:
+                    self.progress(1234)  # так делает провайдер по ходу потоковой выдачи
+                return super().complete(system, messages)
+        w = self.window("a.py")
+        prov = Streaming(["Готово."])
+        w.providers = {"cheap": prov, "strong": prov}
+        w.on_typing = lambda n: seen.append(n)
+        w.ask_ai("привет")
+        self.wait(w)
+        self.assertEqual(seen, [1234])
+        self.assertIsNone(prov.progress)  # после работы подписка снята
+
+    def test_label_text(self):
+        w = self.window("a.py")
+        w.worker = object()  # идёт работа
+        w.on_typing(321)
+        self.assertEqual(w.chat.busy_label.text(), "ИИ пишет ответ… 321 симв.")
+        w.worker = None
+
+
 class ConnectionsGuiTest(GuiCase):
     def dialog(self, rows=(), roles=None, ping_fn=None):
         from aiedit.connections import Roles
@@ -827,13 +1139,17 @@ class ConnectionsGuiTest(GuiCase):
         dlg.show_keys.setChecked(False)
         self.assertEqual(dlg.keys[3].echoMode(), QLineEdit.EchoMode.Password)
 
-    def test_extra_field_only_for_custom_model(self):
+    def test_extra_field_is_required_for_custom_and_an_optional_gateway_for_catalog_models(self):
         dlg = self.dialog()
         dlg.show()
+        self.assertFalse(dlg.extras[0].isVisible())  # строка не выбрана
         self.pick(dlg, 0, "custom")
         self.assertTrue(dlg.extras[0].isVisible())
+        self.assertIn("идентификатор модели", dlg.extras[0].placeholderText())
         self.pick(dlg, 0, "sonnet")
-        self.assertFalse(dlg.extras[0].isVisible())
+        self.assertTrue(dlg.extras[0].isVisible())  # необязательный адрес шлюза
+        self.assertIn("шлюза", dlg.extras[0].placeholderText())
+        self.assertEqual(dlg.extras[0].text(), "")
 
     def test_role_lists_follow_rows_and_keep_choice(self):
         dlg = self.dialog()
@@ -903,7 +1219,7 @@ class ConnectionsGuiTest(GuiCase):
         row = dlg.rows()[0]
         self.assertEqual((row.model, row.extra), ("glm", "glm-5.3 | https://open.bigmodel.cn/api/paas/v4"))
         self.pick(dlg, 0, "sonnet", "k")
-        self.assertEqual((dlg.extras[0].text(), dlg.extras[0].isVisible()), ("", False))
+        self.assertEqual(dlg.extras[0].text(), "")  # адрес прежней модели на другую не переезжает
 
     def test_specialty_reaches_roster_and_summary(self):
         from aiedit.connections import Connection, Roles
@@ -1253,20 +1569,24 @@ class AnalysisGuiTest(GuiCase):
         self.assertTrue(any("Статанализ [lint W1] строка 2: unused thing" in n for n in self.items[0]["notes"]))
         self.assertIn("static analysis (lint): 1 open issue(s) after 0 fix round(s)", w.history[-1].text)
 
-    def test_runs_before_the_security_review_in_conductor_mode(self):
+    def test_review_goes_first_then_analysis_then_review_again_if_analysis_changed_the_code(self):
         from aiedit.roster import Roster, Worker
         w = self.window_with([], conductor=True)
-        glm, sonnet = Script(["@@findings\nsummary: no issues found\n@@end"]), Script([self.BAD_EDIT, "ok", self.FIX_EDIT, "ok"])
+        clean = "@@findings\nsummary: no issues found\n@@end"
+        glm, sonnet = Script([clean, clean]), Script([self.BAD_EDIT, "ok", self.FIX_EDIT, "ok"])
         w.conductor_provider = Script(["@@plan\nsummary: s\n@@task t1\nworker: sonnet\ngoal: change run\nfiles: main.py\nrisk: low\n@@end"])
-        w.roster = Roster([Worker("sonnet", sonnet, "mid", 2, 10, "mid"), Worker("glm", glm, "review", 0, 0, "mid", "security")])
+        w.roster = Roster([Worker("sonnet", sonnet, "mid", 2, 10, "mid"), Worker("opus", Script([]), "strong", 4, 20, "strong", "backend"),
+                           Worker("glm", glm, "review", 0, 0, "mid", "security")])  # два исполнителя: иначе дирижёр пропускается
         w.review_on = True
         w.ask_ai("change run")
         self.wait(w)
         lines = [m[1] for m in w.chat.messages if m[0] == "system"]
-        first_analysis = next(i for i, l in enumerate(lines) if l.startswith("статанализ"))
         first_review = next(i for i, l in enumerate(lines) if l.startswith("безопасность"))
-        self.assertLess(first_analysis, first_review)
-        self.assertIn("# fine", glm.seen[0][-1]["content"])  # безопасник видит уже исправленный код
+        first_analysis = next(i for i, l in enumerate(lines) if l.startswith("статанализ"))
+        self.assertLess(first_review, first_analysis)  # сначала проверяющий, потом программы
+        self.assertTrue(any("статанализ внёс правки: проверяющий смотрит ещё раз" in l for l in lines))
+        self.assertNotIn("# fine", glm.seen[0][-1]["content"])  # в первый раз он видит код как написал автор
+        self.assertIn("# fine", glm.seen[1][-1]["content"])     # во второй раз - уже исправленный по замечанию статанализа
 
     def test_toggle_persists_and_off_means_no_analyzer_run(self):
         w = self.window_with([self.BAD_EDIT, "wrote it"])
@@ -1328,7 +1648,7 @@ class JournalGuiTest(GuiCase):
         self.assertEqual(top[0].text(2), "2 мест")
         self.assertEqual([top[0].child(i).text(0) for i in range(2)], ["строки 1-40", "строка 90"])
         self.assertEqual([top[0].child(i).text(1) for i in range(2)], ["+40 -3", "+1 -1"])
-        self.assertEqual(top[0].text(4), "opus")
+        self.assertEqual(top[0].text(4), "ИИ · opus")
         self.assertEqual(top[1].text(5), "1")
         self.assertIn("unused", top[1].child(0).toolTip(5))
         self.assertIn("4 мест в 3 файлах, +43 -5 строк", v.summary.text())
@@ -1926,7 +2246,7 @@ class TerminalGuiTest(GuiCase):
         self.ran = []
         saved = (sandbox.run_bwrap, sandbox._available)
 
-        def fake(command, work, venv, extra, timeout):
+        def fake(command, work, venv, extra, timeout, hide=()):
             self.ran.append((command, (work / "a.py").read_text()))
             return checks.CheckResult(command, 0, "1 passed", 0.2)
         sandbox.run_bwrap, sandbox._available = fake, ""  # без настоящей песочницы: проверяем окно
@@ -2163,6 +2483,78 @@ class OutboundGuiTest(GuiCase):
         w.ask_ai(f"ключ {self.KEY}")
         self.wait(w)
         self.assertEqual(len(self.asked), 2)
+
+
+class CopiesGuiTest(GuiCase):
+    """Файл переименовали мимо редактора: при открытии редактор спрашивает, что делать с закрытым кодом."""
+
+    def renamed(self):
+        (self.root / "pay.py").write_text("def pay(x):\n    fee = 0.07\n    return x * fee\n\nOK = 1\n")
+        m = Marks()
+        m.add("interface", 0, 2)
+        m.save(self.root / "pay.py", (self.root / "pay.py").read_text())
+        os.rename(self.root / "pay.py", self.root / "money.py")
+
+    def open_with(self, answer):
+        self.renamed()
+        w = self.window(open_file=None)
+        asked = []
+        w.ask_copies = lambda name, found: (asked.append((name, [(m.start, m.end, m.level) for m in found])), answer)[1]
+        doc = w.load(self.root / "money.py")
+        self.assertEqual(asked, [("money.py", [(0, 2, "interface")])])
+        return w, doc
+
+    def test_close_again_restores_the_zone_on_disk(self):
+        w, doc = self.open_with("close")
+        self.assertEqual([(r.level, r.start, r.end) for r in doc.marks.items], [("interface", 0, 2)])
+        m = Marks()
+        m.load(self.root / "money.py", (self.root / "money.py").read_text())
+        self.assertEqual([(r.level, r.start, r.end) for r in m.items], [("interface", 0, 2)])
+
+    def test_leave_open_is_remembered(self):
+        w, doc = self.open_with("open")
+        self.assertEqual(doc.marks.items, [])
+        self.assertIn("0.07", w.make_workspace(log=False).read_file("money.py"))
+        w2 = self.window(open_file=None)
+        w2.ask_copies = lambda name, found: self.fail("решение уже принято")
+        w2.load(self.root / "money.py")
+
+    def test_later_keeps_it_hidden_from_the_model(self):
+        w, doc = self.open_with("later")
+        self.assertNotIn("0.07", w.make_workspace(log=False).read_file("money.py"))
+        inp = w.current_input()
+        self.assertNotIn("0.07", guard.redact(inp.text, inp.regions).text)
+
+    def test_old_sidecar_is_upgraded_on_open(self):
+        (self.root / "p.py").write_text("def p():\n    return 'TOP_SECRET_X'\n")
+        (self.root / "p.py.aimarks.json").write_text(json.dumps(
+            {"sha256": text_hash((self.root / "p.py").read_text()), "regions": [["hidden", 0, 1]]}))
+        self.window(open_file="p.py")
+        self.assertIn("chunks", json.loads((self.root / "p.py.aimarks.json").read_text()))
+
+
+class OutboundDialogTest(GuiCase):
+    KEY = "sk-ant-api03-AbCdEf0123456789xyzQW"
+
+    def test_dialog_explains_and_shows_full_value_on_request(self):
+        from aiedit import dialogs
+        from aiedit.qt import QTimer
+        w = self.window(open_file=None)
+        findings = outbound.Gate().find(f"вот мой ключ {self.KEY}, почему 401?")
+        seen = {}
+
+        def look():
+            dlg = next(t for t in app.topLevelWidgets() if isinstance(t, dialogs.QDialog) and hasattr(t, "full"))
+            seen["short"] = dlg.view.toPlainText()
+            dlg.full.setChecked(True)
+            seen["full"] = dlg.view.toPlainText()
+            dlg.reject()
+        QTimer.singleShot(0, look)
+        self.assertEqual(dialogs.ask_outbound(w, findings, "claude"), "cancel")
+        self.assertIn("вот мой ключ", seen["short"])
+        self.assertIn("за твои деньги", seen["short"])
+        self.assertNotIn(self.KEY, seen["short"])
+        self.assertIn(self.KEY, seen["full"])
 
 
 if __name__ == "__main__":

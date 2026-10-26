@@ -5,6 +5,8 @@ from .qt import (QColor, QMenu, QPainter, QPlainTextEdit, QPoint, QRect, QSize, 
 BAR_COLORS = {"hidden": "#e5534b", "readonly": "#d4a72c", "confirm": "#4c8dff",
               "explain": "#3fb950", "interface": "#a371f7"}
 BAR_WIDTH = 6
+HUMAN_COLOR = "#14b8a6"  # отметка для себя: узкая полоса правее полосы зоны, модель о ней не знает
+HUMAN_WIDTH = 4
 FILL_ALPHA = 55
 HIGHLIGHT_MODES = ("fill", "underline", "off")
 MENU = (("hidden", "Скрыть от ИИ (hidden)"),
@@ -38,7 +40,11 @@ class Gutter(QWidget):
             self.edit.select_lines(self.anchor, line)
         else:
             region = self.edit.regions[line] if line < len(self.edit.regions) else None
-            self.setToolTip(f"{region.level}: {region.note}" if region is not None and region.note else "")
+            mine = self.edit.human[line] if line < len(self.edit.human) else None
+            tips = [f"{region.level}: {region.note}"] if region is not None and region.note else []
+            if mine is not None:
+                tips.append("для себя (ИИ не видит)" + (f": {mine.note}" if mine.note else ""))
+            self.setToolTip("\n".join(tips))
 
     def mouseReleaseEvent(self, e):
         if self.anchor is None:
@@ -57,6 +63,7 @@ class CodeEdit(QPlainTextEdit):
     def __init__(self):
         super().__init__()
         self.regions: list = []
+        self.human: list = []  # по строке: отметка для себя или None
         self.highlight = "fill"
         self.gutter = Gutter(self)
         self.blockCountChanged.connect(self.update_margin)
@@ -67,6 +74,15 @@ class CodeEdit(QPlainTextEdit):
         self.regions = regions
         self.gutter.update()
         self.paint_text_marks()
+
+    def set_human(self, marks: list):
+        """Отметки для себя по строкам: узкая запись побеждает широкую."""
+        lines: list = [None] * self.blockCount()
+        for r in sorted(marks, key=lambda r: r.end - r.start, reverse=True):
+            for i in range(max(r.start, 0), min(r.end, len(lines) - 1) + 1):
+                lines[i] = r
+        self.human = lines
+        self.gutter.update()
 
     def set_highlight(self, mode: str):
         self.highlight = mode
@@ -100,7 +116,7 @@ class CodeEdit(QPlainTextEdit):
 
     def gutter_width(self) -> int:
         digits = max(3, len(str(self.blockCount())))
-        return BAR_WIDTH + 12 + self.fontMetrics().horizontalAdvance("9") * digits
+        return BAR_WIDTH + HUMAN_WIDTH + 12 + self.fontMetrics().horizontalAdvance("9") * digits
 
     def update_margin(self):
         self.setViewportMargins(self.gutter_width(), 0, 0, 0)
@@ -133,6 +149,9 @@ class CodeEdit(QPlainTextEdit):
                     p.fillRect(0, top, BAR_WIDTH, bottom - top, QColor(BAR_COLORS[region.level]))
                     if region.note and region.start == n:  # белая точка: у зоны есть заметка
                         p.fillRect(1, top + 2, 4, 4, QColor("white"))
+                mine = self.human[n] if n < len(self.human) else None
+                if mine is not None:
+                    p.fillRect(BAR_WIDTH + 1, top, HUMAN_WIDTH - 1, bottom - top, QColor(HUMAN_COLOR))
                 p.drawText(0, top, self.gutter.width() - 6, self.fontMetrics().height(),
                            Qt.AlignmentFlag.AlignRight, str(n + 1))
             block = block.next()
@@ -163,6 +182,13 @@ class CodeEdit(QPlainTextEdit):
         note.setEnabled(any(r is not None and r.level in ("interface", "hidden")
                             for r in self.regions[a:b + 1]))
         note.triggered.connect(lambda _=False: self.markRequested.emit("note", a, b))
+        menu.addSeparator()
+        mine = menu.addAction("Отметка для себя... (ИИ не видит)")
+        mine.triggered.connect(lambda _=False: self.markRequested.emit("human", a, b))
+        unmine = menu.addAction("Снять отметку для себя")
+        unmine.setEnabled(any(self.human[i] is not None for i in range(a, min(b + 1, len(self.human)))))
+        unmine.triggered.connect(lambda _=False: self.markRequested.emit("unhuman", a, b))
+        menu.addSeparator()
         remove = menu.addAction("Снять метку")
         remove.setEnabled(any(self.regions[i] is not None for i in range(a, min(b + 1, len(self.regions)))))
         remove.triggered.connect(lambda _=False: self.markRequested.emit("unmark", a, b))

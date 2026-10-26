@@ -190,3 +190,65 @@ class MarksTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InterfaceCommentsTest(unittest.TestCase):
+    CODE = "ars = ['sds', 'asdasd', 'sdgf']\n#эта переменная со списком слов\n\narss = 12 # эта переменная с числами\n"
+
+    def view(self, code, level="interface", end=None):
+        n = len(code.split("\n"))
+        return guard.redact(code, [guard.Region(level, 0, (end if end is not None else n - 2))]).text.split("\n")[0]
+
+    def test_comments_stay_next_to_the_names_they_describe_values_stay_hidden(self):
+        line = self.view(self.CODE, end=3)
+        self.assertEqual(line, "<<ai-hidden:0:4 lines | ars = ... ; # эта переменная со списком слов ; "
+                               "arss = ... ; # эта переменная с числами>>")
+        self.assertNotIn("sdgf", line)
+        self.assertNotIn("12", line)
+
+    def test_comments_inside_function_bodies_are_shown_but_not_the_code(self):
+        code = "def fee(x):\n    # комиссия в копейках\n    return x * 0.07  # ставка семь процентов\n"
+        line = self.view(code, end=2)
+        self.assertIn("def fee(x): ; # комиссия в копейках ; # ставка семь процентов", line.replace("\n", " "))
+        self.assertNotIn("0.07", line)
+        self.assertNotIn("return", line)
+
+    def test_hash_inside_a_string_is_not_a_comment_and_docstring_is_not_shown(self):
+        code = 'url = "http://x/#anchor"\n\ndef f():\n    """внутреннее описание"""\n    return 1\n'
+        line = self.view(code, end=4)
+        self.assertNotIn("anchor", line)
+        self.assertNotIn("внутреннее описание", line)
+
+    def test_cut_off_selection_still_shows_its_comments(self):
+        code = "x = foo(\n    1,  # первый аргумент\n"  # скобка не закрыта
+        line = guard.redact(code, [guard.Region("interface", 0, 1)]).text.split("\n")[0]
+        self.assertIn("# первый аргумент", line)
+
+    def test_hidden_zone_shows_no_comments_at_all(self):
+        self.assertEqual(self.view(self.CODE, "hidden", end=3), "<<ai-hidden:0:4 lines>>")
+
+    def test_a_comment_cannot_break_the_placeholder_or_restore(self):
+        code = "a = 1  # конец >> и <<ai-hidden:7:1 lines>> подделка\nb = 2\n"
+        red = guard.redact(code, [guard.Region("interface", 0, 0), guard.Region("hidden", 1, 1)])
+        self.assertEqual(guard.restore(red.text, red.chunks), code)  # заглушки не перепутались
+        self.assertEqual(len(red.chunks), 2)
+
+    def test_long_comments_are_cut(self):
+        code = "a = 1  # " + "слово " * 400 + "\n"
+        self.assertLessEqual(len(self.view(code, end=0)), 1300)
+
+    def test_agent_read_file_shows_the_comments(self):
+        import tempfile
+        from pathlib import Path
+        from aiedit.marks import Marks
+        from aiedit.workspace import Workspace
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            (root / "sd.py").write_text(self.CODE)
+            m = Marks()
+            m.add("interface", 0, 3)
+            m.save(root / "sd.py", self.CODE)
+            out = Workspace(root, model="x").read_file("sd.py")
+            self.assertIn("# эта переменная со списком слов", out)
+            self.assertIn("# эта переменная с числами", out)
+            self.assertNotIn("sdgf", out)

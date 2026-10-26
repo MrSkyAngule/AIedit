@@ -5,18 +5,22 @@
   explain  - не защита: ИИ по запросу объясняет этот код
   confirm  - модель может менять, но только после подтверждения человека
   readonly - модель видит код, но менять его нельзя
-  interface - модель видит только сигнатуры (имя, типы), тела и значения скрыты, менять нельзя
+  interface - модель видит сигнатуры (имя, типы) и комментарии # зоны, тела и значения скрыты, менять нельзя
   hidden   - модель код не видит вообще (уходит заглушка), менять нельзя
 """
 import ast
 import difflib
+import io
 import re
+import textwrap
+import tokenize
 from dataclasses import dataclass, field, replace
 
 SEVERITY = {"explain": 0, "confirm": 1, "readonly": 2, "interface": 3, "hidden": 4}
 CONCEALED = ("interface", "hidden")  # уровни, чей код модель не получает
 PLACEHOLDER = re.compile(r"^\s*<<ai-hidden:(\d+):\d+ lines(?: \|.*)?>>\s*$")
 MAX_SIGNATURE = 400
+MAX_COMMENTS = 800  # дополнительное место в заглушке interface под комментарии зоны
 MAX_NOTE = 300
 
 
@@ -59,10 +63,9 @@ def line_regions(n_lines: int, regions: list[Region]) -> list[Region | None]:
     return result
 
 
-def signatures(code: str) -> list[str]:
-    """Сигнатуры верхнего уровня (Python): имя, аргументы, типы. Без тел, значений и докстрингов."""
+def _signature_items(code: str) -> list[tuple[int, str]]:
+    """Сигнатуры верхнего уровня (Python) с номером строки: имя, аргументы, типы. Без тел, значений и докстрингов."""
     try:
-        import textwrap
         tree = ast.parse(textwrap.dedent(code))
     except (SyntaxError, ValueError):
         return []
@@ -80,17 +83,43 @@ def signatures(code: str) -> list[str]:
                                  body=[ast.Expr(dots)], decorator_list=[])
         return ast.unparse(ast.fix_missing_locations(clone)).splitlines()[0]
 
-    found = []
+    found: list[tuple[int, str]] = []
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            found.append(header(node))
+            found.append((node.lineno, header(node)))
             if isinstance(node, ast.ClassDef):
-                found += ["  " + header(n) for n in node.body
+                found += [(n.lineno, "  " + header(n)) for n in node.body
                           if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
         elif isinstance(node, (ast.Assign, ast.AnnAssign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            found += [f"{t.id} = ..." for t in targets if isinstance(t, ast.Name)]
+            found += [(node.lineno, f"{t.id} = ...") for t in targets if isinstance(t, ast.Name)]
     return found
+
+
+def signatures(code: str) -> list[str]:
+    return [text for _, text in _signature_items(code)]
+
+
+def comments(code: str) -> list[tuple[int, str]]:
+    """Комментарии # зоны: (номер строки, текст). Читает токены, поэтому # внутри строки комментарием не считается.
+    Докстринги - не комментарии и сюда не попадают."""
+    found: list[tuple[int, str]] = []
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(textwrap.dedent(code)).readline):
+            if tok.type == tokenize.COMMENT and tok.string.lstrip("#").strip():
+                found.append((tok.start[0], "# " + tok.string.lstrip("#").strip()))
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        pass  # кусок оборван посреди скобки или отступа: берём то, что успели прочитать
+    return found
+
+
+def interface_view(code: str) -> tuple[list[str], bool]:
+    """Что видит модель в зоне interface: сигнатуры и комментарии в том порядке, в каком они стоят в коде.
+    Так видно, к чему относится комментарий. Второе значение: есть ли среди них комментарии."""
+    notes = comments(code)
+    merged = sorted([(line, 0, text) for line, text in _signature_items(code)]
+                    + [(line, 1, text) for line, text in notes])  # на одной строке сигнатура идёт раньше комментария
+    return [text for _, _, text in merged], bool(notes)
 
 
 def _clean(text: str, limit: int) -> str:
@@ -108,10 +137,11 @@ def notes_for(regions: list[Region], a: int, b: int) -> list[str]:
 
 
 def _placeholder(k: int, code: str, n: int, with_signatures: bool, notes: list[str] | None = None) -> str:
-    sigs = signatures(code) if with_signatures else []
+    sigs, has_comments = interface_view(code) if with_signatures else ([], False)
     parts = []
     if sigs:
-        parts.append(_clean(" ; ".join(s.strip() if i else s for i, s in enumerate(sigs)), MAX_SIGNATURE))
+        parts.append(_clean(" ; ".join(s.strip() if i else s for i, s in enumerate(sigs)),
+                            MAX_SIGNATURE + (MAX_COMMENTS if has_comments else 0)))
     if notes:
         parts.append("note: " + _clean(" / ".join(notes), MAX_NOTE))
     return f"<<ai-hidden:{k}:{n} lines{''.join(' | ' + p for p in parts)}>>"

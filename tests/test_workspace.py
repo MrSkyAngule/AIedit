@@ -226,3 +226,94 @@ class SafetyTest(WsCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PendingNewFilesVisibleTest(unittest.TestCase):
+    """Файл, созданный агентом, но ещё не применённый, должен быть виден ему же (иначе круг исправлений его не найдёт)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name).resolve()
+        (self.root / "sd.py").write_text("ars = 1\n")
+        self.ws = Workspace(self.root, model="x", log_enabled=False)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_new_file_is_listed_and_found_by_search(self):
+        self.ws.create_file("app.py", "app.run(debug=True)\n")
+        self.assertEqual(self.ws.list_files(".").split("\n"), ["app.py", "sd.py"])
+        self.assertIn("app.py:1: app.run(debug=True)", self.ws.search("debug=True"))
+        self.assertFalse((self.root / "app.py").exists())  # на диск по-прежнему ничего не попало
+
+    def test_new_file_in_a_new_folder_shows_the_folder_too(self):
+        self.ws.create_file("templates/index.html", "<h1>hi</h1>\n")
+        self.assertEqual(self.ws.list_files(".", 3).split("\n"), ["templates/", "  index.html", "sd.py"])
+        self.assertEqual(self.ws.list_files(".", 1).split("\n"), ["templates/", "sd.py"])
+        self.assertIn("templates/index.html:1", self.ws.search("hi"))
+        self.assertIn("index.html", self.ws.list_files("templates"))
+
+    def test_new_file_in_an_existing_folder(self):
+        (self.root / "pkg").mkdir()
+        (self.root / "pkg" / "a.py").write_text("x = 1\n")
+        self.ws.create_file("pkg/b.py", "y = 2\n")
+        self.assertEqual(self.ws.list_files("pkg").split("\n"), ["a.py", "b.py"])
+
+    def test_renamed_and_deleted_files_follow_the_pending_state(self):
+        self.ws.rename_file("sd.py", "words.py")
+        listed = self.ws.list_files(".").split("\n")
+        self.assertEqual(listed, ["words.py"])
+        self.ws.create_file("tmp.py", "z\n")
+        self.ws.delete_file("tmp.py")
+        self.assertNotIn("tmp.py", self.ws.list_files("."))
+
+    def test_nothing_changes_for_ordinary_projects(self):
+        self.assertEqual(self.ws.list_files("."), "sd.py")
+        self.assertEqual(self.ws.pending_created(self.root), [])
+
+
+class SymlinkOutsideTheProjectTest(unittest.TestCase):
+    """Ссылка из проекта наружу не даёт ни прочитать то, что снаружи, ни сломать поиск."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name).resolve()
+        self.root = base / "proj"
+        self.root.mkdir()
+        self.outside = base / "outside"
+        self.outside.mkdir()
+        (self.outside / "secret.txt").write_text("TOP_SECRET_OUTSIDE\n")
+        (self.root / "main.py").write_text("print('TOP_SECRET_OUTSIDE is not here')\n")
+        (self.root / "link_dir").symlink_to(self.outside)
+        (self.root / "link_file").symlink_to(self.outside / "secret.txt")
+        self.ws = Workspace(self.root, model="x", log_enabled=False)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_outside_files_are_not_readable_through_links_or_dotdot(self):
+        for path in ("link_file", "link_dir/secret.txt", "../outside/secret.txt", str(self.outside / "secret.txt")):
+            self.assertTrue(self.ws.read_file(path).startswith("ERROR"), path)
+            self.assertNotIn("TOP_SECRET", self.ws.read_file(path))
+
+    def test_search_still_works_and_never_goes_outside(self):
+        out = self.ws.search("TOP_SECRET")
+        self.assertEqual(out.count("\n"), 0)
+        self.assertTrue(out.startswith("main.py:1:"))
+        self.assertNotIn("secret.txt", out)
+
+    def test_listing_hides_links_that_lead_outside(self):
+        self.assertEqual(self.ws.list_files("."), "main.py")
+
+    def test_outside_is_not_visible_and_does_not_raise(self):
+        self.assertFalse(self.ws.visible(self.outside))
+        self.assertFalse(self.ws.visible(self.outside / "secret.txt"))
+        self.assertTrue(self.ws.visible(self.root / "main.py"))
+
+    def test_sandbox_copy_does_not_include_what_links_point_to(self):
+        from aiedit import sandbox
+        dest = Path(self.tmp.name) / "copy"
+        dest.mkdir()
+        sandbox.build_copy(self.ws, dest)
+        names = sorted(p.name for p in dest.rglob("*"))
+        self.assertEqual(names, ["main.py"])

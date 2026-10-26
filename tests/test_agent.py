@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from aiedit import agent, sendlog
+from aiedit import agent, prompts, sendlog
 from aiedit.marks import Marks
 from aiedit.orchestrator import Turn
 from aiedit.policy import AccessDenied, Rules
@@ -248,3 +248,217 @@ class DemoAgentTest(AgentCase):
         ws.list_files()
         ws.read_file("main.py")
         self.assertEqual(sendlog.read(self.root), [])
+
+
+class DiscussTest(AgentCase):
+    def go_discuss(self, replies, **kw):
+        prov = Script(replies)
+        ws = Workspace(self.root, model="script")
+        ws.read_only = True
+        return agent.run("что лучше?", ws, prov, system=prompts.DISCUSS_SYSTEM, **kw), prov, ws
+
+    def test_every_edit_tool_is_refused_and_nothing_is_proposed(self):
+        res, prov, ws = self.go_discuss([
+            "@@tool edit_file\npath: main.py\n@@old\nprint(pay.free())\n@@new\nprint(2)\n@@end",
+            "@@tool create_file\npath: new.py\n@@content\nx = 1\n@@end",
+            tool("delete_file", path="main.py"),
+            tool("rename_file", path="main.py", new_path="m.py"),
+            "Править нельзя, только обсуждаем."])
+        results = "\n".join(m["content"] for m in prov.seen[-1][1] if m["role"] == "user")
+        self.assertEqual(results.count("read-only review mode"), 4)  # по одному отказу на каждый инструмент правки
+        self.assertEqual(res.changes, [])
+        self.assertEqual((self.root / "main.py").read_text(), self.files["main.py"])
+        self.assertFalse((self.root / "new.py").exists())
+
+    def test_reading_still_works_and_closed_code_stays_closed(self):
+        res, prov, _ = self.go_discuss([tool("read_file", path="pkg/pay.py"), "Вот что здесь есть."])
+        self.assertIn("def free", prov.seen[1][1][-1]["content"])
+        self.assertNotIn("HIDDEN_SECRET_LOGIC", prov.everything())
+
+    def test_prompt_says_discuss_and_no_helpers_are_offered(self):
+        _, prov, _ = self.go_discuss(["ok"], terminal=lambda c: "ran", install=lambda p: "ok")
+        system = prov.seen[0][0]
+        self.assertIn("Mode: discuss.", system)
+        self.assertNotIn("Mode: agent.", system)
+        self.assertIn("Editing is switched off", system)
+        self.assertNotIn("run_command", system)  # помощники read_only отключает сам агент
+        self.assertTrue(system.endswith(prompts.REPLY_LANGUAGE))
+
+
+class TolerantParseTest(unittest.TestCase):
+    def test_marker_glued_to_text_with_pipe_or_colon(self):
+        reply = "@@tool edit_file\npath: a.py\n@@old|def f():\n    return 1\n@@new:\ndef f():\n    return 2\n@@end"
+        (call,), _ = agent.parse_calls(reply)
+        self.assertEqual(call.error, "")
+        self.assertEqual(call.args["old_text"], "def f():\n    return 1")  # отступ внутри сохранён
+        self.assertEqual(call.args["new_text"], "def f():\n    return 2")
+
+    def test_error_carries_an_example_of_the_right_format(self):
+        (call,), _ = agent.parse_calls("@@tool edit_file\npath: a.py\nthis is not an argument\n@@end")
+        self.assertIn("bad or extra argument line", call.error)
+        self.assertIn("@@old\nexact old text\n@@new", call.error)
+
+    def test_missing_arguments_also_show_the_example(self):
+        out = agent.execute(Workspace(Path(tempfile.mkdtemp())), agent.Call("edit_file", {"path": "x.py"}))
+        self.assertIn("missing arguments: old_text, new_text", out)
+        self.assertIn("@@tool edit_file", out)
+
+
+class LoopGuardTest(AgentCase):
+    OK = "$ python main.py\nexit code 0\nok"
+    FAIL = "$ python main.py\nexit code 1\nTraceback"
+
+    @staticmethod
+    def edit(old, new):
+        return f"@@tool edit_file\npath: main.py\n@@old\n{old}\n@@new\n{new}\n@@end"
+
+    def chain(self, n, run=tool("run_command", command="python main.py")):
+        """n циклов «правка + запуск»: каждая правка новая, поэтому одинаковых вызовов нет."""
+        replies = [self.edit("print(pay.free())", "print(pay.free())  # v1") + "\n" + run]
+        for k in range(1, n):
+            replies.append(self.edit(f"# v{k}", f"# v{k + 1}") + "\n" + run)
+        return replies
+
+    def test_editor_reminds_to_stop_after_two_passes_in_a_row(self):
+        res, prov, _ = self.go(self.chain(2) + ["Готово."], terminal=lambda c: self.OK)
+        self.assertEqual(res.stopped, "")
+        self.assertNotIn(prompts.OUT_PASSED_TWICE, prov.seen[1][1][-1]["content"])  # после первого прохода рано
+        self.assertIn(prompts.OUT_PASSED_TWICE, prov.seen[2][1][-1]["content"])      # после второго - напоминание
+        self.assertEqual(res.text, "Готово.")
+
+    def test_editor_stops_a_loop_of_edit_and_pass(self):
+        res, prov, ws = self.go(self.chain(10), terminal=lambda c: self.OK)
+        self.assertIn("зациклилось", res.stopped)
+        self.assertEqual(res.steps, agent.LOOP_PASSES)  # не 10 шагов
+        self.assertFalse(res.from_model)
+        self.assertIn("зациклилось", res.text)
+        self.assertEqual(len(res.changes), 1)  # то, что успели предложить, человек всё равно увидит
+
+    def test_a_failing_run_resets_the_count(self):
+        outputs = iter([self.OK, self.OK, self.FAIL, self.OK, self.OK, self.OK])
+        res, prov, _ = self.go(self.chain(6) + ["Готово."], terminal=lambda c: next(outputs))
+        self.assertEqual(res.stopped, "")
+        self.assertEqual(res.text, "Готово.")
+
+    def test_same_edit_repeated_three_times_is_a_loop(self):
+        same = self.edit("print(pay.free())", "print(pay.free())  # x")
+        res, _, _ = self.go([same] * 8)
+        self.assertIn("повторил одно и то же", res.stopped)
+        self.assertEqual(res.steps, agent.LOOP_SAME_REPLY)
+
+    def test_rereading_a_file_is_not_a_loop(self):
+        res, _, _ = self.go([tool("read_file", path="main.py")] * 5 + ["Готово."])
+        self.assertEqual(res.stopped, "")
+
+    def test_command_passed_reads_the_exit_code_only(self):
+        self.assertTrue(agent.command_passed("$ x\nexit code 0\nok"))
+        self.assertFalse(agent.command_passed("$ x\nexit code 2\nbad"))
+        self.assertIsNone(agent.command_passed("ERROR: no terminal"))
+        self.assertIsNone(agent.command_passed("ran"))
+
+
+class InventedResultsTest(AgentCase):
+    FAKE = "@@tool read_file\npath: main.py\n@@end</think>@@result read_file\n1| invented contents\n@@end"
+
+    def test_invented_result_is_cut_even_when_glued_to_the_end_marker(self):
+        clean, invented = agent.strip_fake_results(self.FAKE)
+        self.assertTrue(invented)
+        self.assertNotIn("invented", clean)
+        (call,), _ = agent.parse_calls(self.FAKE)
+        self.assertEqual((call.name, call.args, call.error), ("read_file", {"path": "main.py"}, ""))
+
+    def test_everything_after_an_invented_result_is_thrown_away(self):
+        reply = self.FAKE + "\n@@tool delete_file\npath: main.py\n@@end"
+        calls, _ = agent.parse_calls(reply)
+        self.assertEqual([c.name for c in calls], ["read_file"])  # удаление построено на выдумке
+
+    def test_result_word_inside_an_edit_is_just_text(self):
+        reply = ("@@tool edit_file\npath: main.py\n@@old\nprint(pay.free())\n@@new\n"
+                 "@@result looks like this\nprint(1)\n@@end")
+        clean, invented = agent.strip_fake_results(reply)
+        self.assertFalse(invented)
+        self.assertEqual(clean, reply)
+
+    def test_loop_tells_the_model_and_keeps_the_invention_out_of_history(self):
+        res, prov, _ = self.go([self.FAKE, "Прочитал main.py."])
+        second = prov.seen[1][1]
+        self.assertNotIn("invented contents", "\n".join(m["content"] for m in second))
+        self.assertIn(prompts.OUT_INVENTED_RESULT, second[-1]["content"])
+        self.assertIn("print(pay.free())", second[-1]["content"])  # настоящий результат от редактора
+        self.assertEqual(res.text, "Прочитал main.py.")
+
+    def test_prompts_forbid_guessing(self):
+        for system in (prompts.AGENT_SYSTEM, prompts.DISCUSS_SYSTEM):
+            self.assertIn("Never write @@result blocks", system)
+            self.assertIn("Never invent file contents, values, outputs or test results", system)
+            self.assertIn("ask the user instead of guessing", system)
+            self.assertTrue(system.endswith(prompts.REPLY_LANGUAGE))
+
+
+class VersionsToolsTest(AgentCase):
+    def test_project_environment_tool_shows_what_the_project_declares(self):
+        (self.root / "requirements.txt").write_text("flask==3.1.3\n")
+        res, prov, _ = self.go([tool("project_environment"), "Использую Flask 3.1.3."])
+        out = prov.seen[1][1][-1]["content"]
+        self.assertIn("@@result project_environment", out)
+        self.assertIn("flask==3.1.3", out)
+        self.assertIn("смотрю версии и ПО проекта", res.calls)
+
+    def test_package_version_works_only_when_the_editor_gives_a_lookup(self):
+        asked = []
+        res, prov, _ = self.go(["@@tool package_version\nname: flask==3.0.0\n@@end", "Беру 3.1.3."],
+                               versions=lambda n: asked.append(n) or "pypi Flask: latest stable 3.1.3")
+        self.assertEqual(asked, ["flask==3.0.0"])
+        self.assertIn("latest stable 3.1.3", prov.seen[1][1][-1]["content"])
+        self.assertIn("проверяю версию пакета: flask==3.0.0", res.calls)
+
+    def test_without_internet_the_model_is_told_not_to_present_remembered_versions_as_current(self):
+        res, prov, _ = self.go(["@@tool package_version\nname: flask\n@@end", "Версии не проверены."])
+        out = prov.seen[1][1][-1]["content"]
+        self.assertIn("not available here", out)
+        self.assertIn("Do not present remembered versions as current", out)
+        self.assertNotIn("package_version: name", prov.seen[0][0])  # и инструмента в подсказке нет
+
+    def test_lookup_is_offered_in_the_prompt_only_when_it_exists(self):
+        _, prov, _ = self.go(["ok"], versions=lambda n: "x")
+        self.assertIn("package_version: name", prov.seen[0][0])
+        self.assertIn("Never pin from memory", prov.seen[0][0])
+
+    def test_reviewer_in_read_only_mode_never_gets_the_lookup(self):
+        ws = Workspace(self.root, model="script")
+        ws.read_only = True
+        prov = Script(["ok"])
+        agent.run("t", ws, prov, versions=lambda n: "x")
+        self.assertNotIn("package_version: name", prov.seen[0][0])
+
+    def test_rules_about_versions_are_in_every_agent_prompt(self):
+        for system in (prompts.AGENT_SYSTEM, prompts.DISCUSS_SYSTEM):
+            self.assertIn("EXISTING project call project_environment first", system)
+            self.assertIn("ask ONCE", system)
+            self.assertIn("NOT what the user runs", system)
+            self.assertIn("ADD a dependency", system)
+            self.assertIn("never pin its version from memory", system)
+            self.assertIn("project_environment: (no arguments)", system)
+
+    def test_first_message_marks_an_empty_project_as_new_and_a_filled_one_not(self):
+        fresh = Workspace(Path(tempfile.mkdtemp()).resolve(), model="script")
+        self.assertIn(prompts.KIND_NEW, agent.first_message("сделай сайт", fresh))
+        self.assertNotIn(prompts.KIND_NEW, agent.first_message("поправь", Workspace(self.root, model="script")))
+
+    def test_first_message_of_an_existing_project_carries_its_environment_or_says_it_is_unknown(self):
+        unknown = agent.first_message("поправь", Workspace(self.root, model="script"))
+        self.assertIn(prompts.SEC_ENV, unknown)
+        self.assertIn("UNKNOWN", unknown)
+        self.assertIn("ask the user now", unknown)
+        (self.root / "requirements.txt").write_text("flask==3.1.3\n")
+        known = agent.first_message("поправь", Workspace(self.root, model="script"))
+        self.assertIn("flask==3.1.3", known)
+        self.assertNotIn("UNKNOWN", known)
+        fresh = agent.first_message("сделай", Workspace(Path(tempfile.mkdtemp()).resolve(), model="script"))
+        self.assertNotIn(prompts.SEC_ENV, fresh)  # у нового проекта окружения ещё нет, есть пометка «новый»
+
+    def test_environment_in_the_first_message_is_capped(self):
+        (self.root / "requirements.txt").write_text("\n".join(f"package{i}==1.{i}.0" for i in range(300)))
+        msg = agent.first_message("поправь", Workspace(self.root, model="script"))
+        env = msg.split(prompts.SEC_ENV, 1)[1].split(prompts.SEC_TREE, 1)[0]
+        self.assertLessEqual(len(env), agent.ENV_IN_FIRST_MESSAGE + 5)

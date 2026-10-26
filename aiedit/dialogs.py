@@ -2,7 +2,9 @@
 import difflib
 import html
 
-from .qt import (QDialog, QFont, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPlainTextEdit,
+from . import journal
+
+from .qt import (QCheckBox, QDialog, QFont, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPlainTextEdit,
                  QPushButton, Qt, QTextEdit, QVBoxLayout)
 
 _DIFF_STYLE = {"+": "background:#d4f5d4;", "-": "background:#f9d6d6;", "@": "background:#e3e8f0;"}
@@ -19,6 +21,63 @@ def diff_html(old: str, new: str, context: int = 3) -> str:
             style = "background:#e3e8f0;"
         out.append(f'<div style="{style} color:#111; white-space:pre;">{html.escape(line) or "&nbsp;"}</div>')
     return "".join(out)
+
+
+MAX_FINDINGS_SHOWN = 30
+
+
+def findings_html(findings, full: bool = False) -> str:
+    """Находки фильтра исходящего для человека: что это, чем опасно и где именно в запросе."""
+    out = []
+    for f in findings[:MAX_FINDINGS_SHOWN]:
+        before, hit, after = f.where(full)
+        mark = f'<span style="background:#fde68a; color:#111; font-weight:bold;">{html.escape(hit)}</span>'
+        out.append(f"<p><b>{html.escape(f.kind)}</b>: {html.escape(f.explain())}<br>"
+                   f'<span style="font-family:monospace;">{html.escape(before)}{mark}{html.escape(after)}</span></p>')
+    if len(findings) > MAX_FINDINGS_SHOWN:
+        out.append(f"<p>... и ещё {len(findings) - MAX_FINDINGS_SHOWN}</p>")
+    return "".join(out)
+
+
+def ask_outbound(parent, findings, model: str) -> str:
+    """Окно фильтра исходящего: mask, send или cancel. Значения сначала обрезаны (на экран могут смотреть),
+    галочка показывает их целиком."""
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("Фильтр исходящего")
+    dlg.resize(680, 440)
+    lay = QVBoxLayout(dlg)
+    head = QLabel(f"Запрос к модели {model} уйдёт с этим ({len(findings)}). Проверь, можно ли это отправлять.")
+    head.setWordWrap(True)
+    head.setStyleSheet("font-weight:bold;")
+    lay.addWidget(head)
+    view = QTextEdit()
+    view.setReadOnly(True)
+    view.setHtml(findings_html(findings))
+    lay.addWidget(view)
+    full = QCheckBox("Показать найденное полностью")
+    full.toggled.connect(lambda on: view.setHtml(findings_html(findings, on)))
+    lay.addWidget(full)
+    hint = QLabel("«Скрыть» заменит это метками вроде <<masked-1>>: модель увидит метку, а в её ответе метка "
+                  "снова станет настоящим текстом. Решение запомнится до нового чата.")
+    hint.setWordWrap(True)
+    lay.addWidget(hint)
+    answer = {"value": "cancel"}
+
+    def choose(value: str):
+        answer["value"] = value
+        dlg.accept()
+
+    row = QHBoxLayout()
+    row.addStretch()
+    for text, value in (("Отмена", "cancel"), ("Отправить как есть", "send"), ("Скрыть и отправить", "mask")):
+        btn = QPushButton(text)
+        btn.clicked.connect(lambda _=False, v=value: choose(v))
+        btn.setDefault(value == "mask")
+        row.addWidget(btn)
+    lay.addLayout(row)
+    dlg.view, dlg.full = view, full
+    dlg.exec()
+    return answer["value"]
 
 
 def confirm_diff(parent, old: str, new: str, notes: list[str] | None = None,
@@ -87,6 +146,17 @@ def show_text(parent, title: str, text: str, width: int = 760, height: int = 560
     return dlg
 
 
+def ai_badge(item: dict) -> str:
+    """Пометка у файла в списке правок: это написал ИИ, сколько строк вставил и убрал."""
+    if item.get("deleted"):
+        return "(ИИ: удаление)"
+    added = removed = 0
+    for hunk in journal.hunks_for(item["name"], item.get("old"), item["new"]):
+        added, removed = added + hunk.added, removed + hunk.removed
+    kind = "новый, " if item.get("created") else ""
+    return f"({kind}ИИ вставил +{added}" + (f" −{removed}" if removed else "") + ")"
+
+
 class ReviewDialog(QDialog):
     """Набор правок по нескольким файлам: галочки у файлов и дифф выбранного."""
 
@@ -97,8 +167,7 @@ class ReviewDialog(QDialog):
         self.resize(900, 580)
         self.files = QListWidget()
         for it in items:
-            row = QListWidgetItem(it["name"] + ("  (удаление)" if it.get("deleted") else
-                                               "  (новый)" if it.get("created") else ""))
+            row = QListWidgetItem(it["name"] + "  " + ai_badge(it))
             row.setFlags(row.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             row.setCheckState(Qt.CheckState.Checked)
             self.files.addItem(row)

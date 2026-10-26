@@ -1,7 +1,8 @@
 """Панель чата: история сверху (новые сообщения снизу), поле ввода внизу."""
 import html
+import re
 
-from .qt import (QHBoxLayout, QLabel, QMenu, QPlainTextEdit, QPushButton, Qt, QTextEdit,
+from .qt import (QCheckBox, QHBoxLayout, QLabel, QMenu, QPlainTextEdit, QPushButton, Qt, QTextEdit,
                  QToolButton, QVBoxLayout, QWidget, Signal)
 
 USER_BG, USER_FG = "#2b6cb0", "#ffffff"
@@ -11,6 +12,54 @@ MUTED = "#8a8f98"
 
 def _text(s: str) -> str:
     return html.escape(s).replace("\n", "<br>")
+
+
+CODE_BG = "#cfd4db"
+_CODE_SPAN = re.compile(r"(`[^`\n]+`)")
+_BOLD = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*")
+_ITALIC = re.compile(r"(?<![\w*])\*(?=[^\s*])([^*\n]+?)(?<=[^\s*])\*(?![\w*])")
+_BULLET = re.compile(r"^(\s*)[-*•]\s+(.*)$")
+_HEADING = re.compile(r"^#{1,6}\s+(.*)$")
+
+
+def _inline(line: str) -> str:
+    """Разметка внутри строки: `код`, **жирный**, *курсив*. Сначала экранируем всё, потом ставим теги,
+    поэтому чужой HTML в сообщении остаётся текстом. Внутри `кода` ничего не форматируется."""
+    out = []
+    for part in _CODE_SPAN.split(line):
+        if len(part) > 2 and part.startswith("`") and part.endswith("`"):
+            out.append(f'<span style="font-family:monospace; background-color:{CODE_BG};">{html.escape(part[1:-1])}</span>')
+        else:
+            text = _ITALIC.sub(r"<i>\1</i>", _BOLD.sub(r"<b>\1</b>", html.escape(part)))
+            out.append(text)
+    return "".join(out)
+
+
+def markdown_html(text: str) -> str:
+    """Ответ ИИ в HTML для чата: жирный, курсив, код, блоки кода, списки, заголовки. Остальное - обычный текст."""
+    lines = text.split("\n")
+    out, i = [], 0
+    while i < len(lines):
+        line = lines[i]
+        if line.strip().startswith("```"):  # блок кода до закрывающих ``` (или до конца текста)
+            j = i + 1
+            while j < len(lines) and not lines[j].strip().startswith("```"):
+                j += 1
+            code = "\n".join(lines[i + 1:j])
+            out.append(f'<pre style="font-family:monospace; background-color:{CODE_BG}; margin:4px 0;">{html.escape(code, quote=False)}</pre>')
+            i = j + 1
+            continue
+        h = _HEADING.match(line)
+        b = _BULLET.match(line)
+        if h:
+            out.append(f"<b>{_inline(h[1])}</b><br>")
+        elif b:
+            out.append("&nbsp;" * len(b[1]) + f"• {_inline(b[2])}<br>")
+        else:
+            out.append(_inline(line) + "<br>")
+        i += 1
+    html_text = "".join(out)
+    return html_text[:-4] if html_text.endswith("<br>") else html_text
 
 
 def bubble_html(kind: str, text: str, meta: str = "") -> str:
@@ -27,9 +76,10 @@ def bubble_html(kind: str, text: str, meta: str = "") -> str:
     bg, fg = (USER_BG, USER_FG) if user else (AI_BG, AI_FG)
     side = "right" if user else "left"
     label = f'<span style="color:{MUTED}; font-size:small;">{_text(meta)}</span><br>' if meta else ""
+    body = _text(text) if user else markdown_html(text)  # разметку понимаем только в ответах ИИ: свой текст человек видит как набрал
     return (f'<p align="{side}" style="margin:6px 0 0 0;">{label}</p>'
             f'<table align="{side}" width="88%" cellpadding="8" cellspacing="0" bgcolor="{bg}">'
-            f'<tr><td><span style="color:{fg};">{_text(text)}</span></td></tr></table>'
+            f'<tr><td><span style="color:{fg};">{body}</span></td></tr></table>'
             f'<p style="margin:0;"></p>')
 
 
@@ -76,6 +126,9 @@ class ChatPanel(QWidget):
         self.send_btn.clicked.connect(self.submit)
         self.explain_btn = QPushButton("Объяснить зелёные зоны")
         self.explain_btn.clicked.connect(self.explainRequested)
+        self.discuss_box = QCheckBox("Только обсуждать")
+        self.discuss_box.setToolTip("ИИ читает проект и отвечает, но ничего не правит и не запускает")
+        self.discuss_box.toggled.connect(self.update_placeholder)
         # меню справа вверху панели
         self.menu = QMenu(self)
         self.new_chat_action = self.menu.addAction("Новый чат")
@@ -102,6 +155,7 @@ class ChatPanel(QWidget):
 
         row = QHBoxLayout()
         row.addWidget(self.explain_btn)
+        row.addWidget(self.discuss_box)
         row.addStretch()
         row.addWidget(self.send_btn)
         lay = QVBoxLayout(self)
@@ -111,6 +165,15 @@ class ChatPanel(QWidget):
         lay.addWidget(self.busy_row)
         lay.addWidget(self.input)
         lay.addLayout(row)
+
+    DISCUSS_PLACEHOLDER = "Спроси, что делать: ИИ ответит и ничего не изменит (Enter - отправить)"
+
+    @property
+    def discuss(self) -> bool:
+        return self.discuss_box.isChecked()
+
+    def update_placeholder(self, *_):
+        self.input.setPlaceholderText(self.DISCUSS_PLACEHOLDER if self.discuss else self.PLACEHOLDER)
 
     def set_context(self, names: list[str]):
         self.context_row.setVisible(bool(names))

@@ -70,3 +70,12 @@ class SortAndRemarksTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AiBadgeTest(unittest.TestCase):
+    def test_badge_says_the_ai_wrote_it_and_how_much(self):
+        from aiedit.dialogs import ai_badge
+        self.assertEqual(ai_badge({"name": "a.py", "old": "x\n", "new": "x\ny\nz\n"}), "(ИИ вставил +2)")
+        self.assertEqual(ai_badge({"name": "a.py", "old": "x\ny\n", "new": "x\nz\n"}), "(ИИ вставил +1 −1)")
+        self.assertEqual(ai_badge({"name": "n.py", "old": None, "new": "a\nb\n", "created": True}), "(новый, ИИ вставил +2)")
+        self.assertEqual(ai_badge({"name": "d.py", "old": "a\n", "new": "", "deleted": True}), "(ИИ: удаление)")

@@ -181,9 +181,37 @@ class TerminalTest(CopyCase):
         self.assertIn("exit code 1", out)
         self.assertIn("[... earlier output cut ...]", out)
         self.assertNotIn("sk-ant-api03", out)
-        self.assertLess(len(out), sandbox.MAX_TO_MODEL + 200)
+        self.assertLess(len(out.split("\nclosed in this sandbox")[0]), sandbox.MAX_TO_MODEL + 200)  # подсказка не в счёт
         self.assertIn("timed out", self.terminal(timed_out=True, code=None)("sleep 99"))
         self.assertIn("could not start: boom", self.terminal(error="boom", code=None)("x"))
+
+    def test_model_is_told_what_is_closed_in_the_sandbox(self):
+        m = Marks()
+        m.add("interface", 4, 7)  # fee
+        m.add("hidden", 10, 13)   # Vault
+        m.save(self.root / "pay.py", PAY)
+        t = self.terminal()
+        out = t("python pay.py")
+        self.assertIn("closed in this sandbox (the real values are NOT here)", out)
+        self.assertIn("- pay.py: fee (real values are not available", out)
+        self.assertIn("hidden line(s) are gone", out)
+        self.assertIn("do not invent your own values", out)
+        for leak in ("0.07", "42", "Vault", "1337", "SECRET_DOC", "sk-ant"):
+            self.assertNotIn(leak, out)  # называем только то, что модель и так видит в заглушке
+
+    def test_no_notice_when_nothing_is_closed(self):
+        (self.root / "pay.py").unlink()
+        (self.root / "pay.py.aimarks.json").unlink(missing_ok=True)
+        self.assertNotIn("closed in this sandbox", self.terminal()("true"))
+
+    def test_interface_variables_are_named(self):
+        (self.root / "sd.py").write_text("ars = ['a']\n# note\narss = 12  # n\n")
+        m = Marks()
+        m.add("interface", 0, 2)
+        m.save(self.root / "sd.py", "ars = ['a']\n# note\narss = 12  # n\n")
+        out = self.terminal()("python sd.py")
+        self.assertIn("- sd.py: ars, arss (real values are not available: variables are None", out)
+        self.assertNotIn("['a']", out)
 
     def test_bad_commands(self):
         t = self.terminal()
@@ -330,11 +358,19 @@ class SeatbeltTest(unittest.TestCase):
         calls = []
         saved = (sandbox.run_bwrap, sandbox.run_seatbelt, sandbox.sys.platform)
         try:
-            sandbox.run_bwrap = lambda *a: calls.append("bwrap")
-            sandbox.run_seatbelt = lambda *a: calls.append("seatbelt")
+            sandbox.run_bwrap = lambda *a, **k: calls.append("bwrap")
+            sandbox.run_seatbelt = lambda *a, **k: calls.append("seatbelt")
             for p in ("linux", "darwin"):
                 sandbox.sys.platform = p
                 sandbox.run_sandboxed("true", Path("/tmp"))
         finally:
             sandbox.run_bwrap, sandbox.run_seatbelt, sandbox.sys.platform = saved
         self.assertEqual(calls, ["bwrap", "seatbelt"])
+
+
+class ClosedNoticeWordingTest(unittest.TestCase):
+    def test_names_may_be_used_but_values_may_not_be_made_up(self):
+        text = sandbox.closed_notice({"sd.py": {"names": ["ars"], "hidden": 0}})
+        self.assertIn("call the functions, pass the real variable", text)
+        self.assertIn("do not invent your own values", text)
+        self.assertIn("call it sample data", text)

@@ -250,3 +250,24 @@ class TransportTest(unittest.TestCase):
         res = Translator(translator.openai_transport("sk-x", "http://127.0.0.1:9/v1/chat/completions", timeout=2)
                          ).ru_to_en("добавь проверку")
         self.assertFalse(res.translated)
+
+
+class QuotedLiteralsTest(unittest.TestCase):
+    def test_quoted_strings_are_protected_but_apostrophes_are_not(self):
+        from aiedit import translator as t
+        masked, saved = t.mask("выведи результат с подписью 'Сумма:' и \"Привет\" и «Готово»")
+        self.assertEqual(saved, ["'Сумма:'", '"Привет"', "«Готово»"])
+        masked, saved = t.mask("he said it's fine and we don't know why")
+        self.assertEqual(saved, [])  # апостроф в слове не открывает кавычку
+
+    def test_quoted_label_survives_translation_unchanged(self):
+        from aiedit.translator import Translator
+        sent = []
+
+        def transport(payload):
+            sent.append(payload["messages"][-1]["content"])
+            return "print the result with the label {{1}}"
+        res = Translator(transport).ru_to_en("выведи результат с подписью 'Сумма:'")
+        self.assertTrue(res.translated)
+        self.assertEqual(res.text, "print the result with the label 'Сумма:'")
+        self.assertNotIn("Сумма", sent[0])  # переводчик строку не видел

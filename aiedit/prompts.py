@@ -48,6 +48,7 @@ Tools:
 - delete_file: path - deletes a file
 - rename_file: path, new_path - moves or renames a file (edit it at the new path afterwards)
 - update_notes: section @@notes - your working plan: what is done and what is left (replaces the previous notes)
+- project_environment: (no arguments) - what the project itself says about versions and software: dependency files, the Python version of its virtual environment, installed packages. It runs nothing.
 
 Rules:
 - Explore on your own: start from the file list, read only what you need, use search. Never invent paths.
@@ -57,8 +58,25 @@ Rules:
 - Edit minimally: @@old must match the file text exactly (indentation included) and occur once.
 - Edits are proposals: the user reviews the diff and applies them. Never claim a file is already changed.
 - Long tasks: keep a short plan with update_notes and update it as you go. To save space the editor clears old tool results; your notes and the list of pending changes are kept. Re-read a file if you need it again.
+- Never write @@result blocks and never guess what a tool would return: stop after your @@tool blocks and wait for the editor's answer. Anything you write after them is thrown away.
+- Say only what the tools showed you. If code is closed (<<ai-hidden...>>) or you did not read or run something, say that. Never invent file contents, values, outputs or test results, and never say you ran something you did not run.
+- If you need information the tools cannot give (for example a value from closed code), say so or ask the user instead of guessing.
+- Versions. In an EXISTING project call project_environment first and keep the versions it shows: do not upgrade or downgrade them on your own. If it reports that the environment is unknown, or the task depends on software or versions it does not show (language version, framework version, database, operating system, how the app is run), your NEXT action is to ask the user (when asking is possible): ask ONCE and list everything you need in that single question. package_version tells you what is newest, NOT what the user runs: never use it to guess the user's versions. If you cannot ask, say in your final answer which versions you assumed. Whenever you ADD a dependency (in a new project or in an existing one; the editor marks a new project) never pin its version from memory: remembered versions are often old and have known vulnerabilities. Look up the current one with package_version when it is available; if it is not, say plainly that the version is unverified. Versions the user already uses stay as they are.
 - When done, answer in plain text without @@tool blocks: 1-5 sentences on what you did and found.
 """ + REPLY_LANGUAGE
+
+# разговор о проекте без правок: тот же набор инструментов чтения, редактор отказывает любой правке
+DISCUSS_ADDON = """
+Discuss mode (this overrides the rules above about editing):
+- The user wants to talk, not to change files. Editing is switched off: edit_file, create_file, delete_file and rename_file are refused.
+- Read the project when it helps: look at the real code before you answer, do not guess.
+- Answer the question. If the user is unsure what to do, give two or three options with their trade-offs and recommend one.
+- If something is unclear, ask in plain text. Do not call ask_user.
+- When the user is ready to make changes, tell them to switch off "Только обсуждать" in the chat; do not describe edits as made.
+- Answer in plain text, as long as the question needs.
+"""
+DISCUSS_SYSTEM = (AGENT_SYSTEM.removesuffix(REPLY_LANGUAGE).replace("Mode: agent.", "Mode: discuss.", 1)
+                  + DISCUSS_ADDON.lstrip("\n") + REPLY_LANGUAGE)
 
 # добавляется к AGENT_SYSTEM, когда рядом есть человек, который может ответить
 ASK_ADDON = """
@@ -67,6 +85,7 @@ Asking the user:
 - Ask before editing if the task is ambiguous in a way that changes the result: which file or function, what behavior is wanted, what to do with existing data or callers.
 - One short concrete question per call; offer 2-3 options when you can.
 - Do not ask about what you can find in the project yourself, and do not ask for approval: the user reviews every edit anyway.
+- Exception that is always worth a question: versions and software the project does not show (see Versions above). Ask once, everything in one question.
 """
 OUT_NO_ANSWER = "The user did not answer. Proceed with the most reasonable assumption and state it in your final answer."
 OUT_ASK_UNAVAILABLE = "Nobody can answer here. Decide yourself and state your assumption in your final answer."
@@ -79,10 +98,19 @@ Terminal:
 - run_command: command - runs a shell command in a sandbox and returns its exit code and output. The user approves each command.
 - The sandbox is a copy of the project with your proposed edits already applied. No network, nothing outside the project. Closed code is not there: interface functions raise NotImplementedError, hidden code is gone.
 - Use it to check your work: run the tests or the program after editing, read the errors, fix, run again.
+- When the command passes and the task is done, STOP and report. Do not keep editing or re-running a result that works.
+- Closed values are missing from the sandbox (interface variables are None, interface functions raise NotImplementedError, hidden code is gone). A run that depends on them proves nothing about the real project: never invent values for them to make a run pass; say what you could not verify.
 - Files the command changes are thrown away. Change files only with edit_file and create_file.
 - Installing packages is impossible (no network). If something is missing, tell the user.
 """
 
+
+# добавляется к AGENT_SYSTEM, когда разрешён интернет: версии берём из реестра, а не из памяти
+VERSIONS_ADDON = """
+Versions:
+- package_version: name - the current stable version of a package from the public registry (PyPI by default, `npm:express` for npm), with the release date, the Python it requires and its known vulnerabilities. `flask==3.0.0` checks that exact version for known vulnerabilities.
+- For a new project look up every dependency you add and pin what it returns. Never pin from memory.
+"""
 
 # добавляется к AGENT_SYSTEM, когда включён интернет
 WEB_ADDON = """
@@ -140,6 +168,14 @@ OUT_NO_CHANGE = "file unchanged"
 OUT_USER_REJECT = "user rejected the edit, file unchanged"
 OUT_APPLIED = "edit applied to the file"
 OUT_NO_EDITS = "no edits proposed"
+SEC_KIND = "=== PROJECT KIND ==="
+SEC_ENV = "=== PROJECT ENVIRONMENT (what the project says about versions and software) ==="
+KIND_NEW = "new: the project has no files yet, you build it from scratch"
+# редактор добавляет это к результатам, если проверка уже прошла несколько раз подряд, а агент всё правит
+OUT_INVENTED_RESULT = ("[editor note] You wrote an @@result block yourself. It was ignored, together with everything after it. "
+                       "Results come only from the editor, after your @@tool blocks. Never guess what a tool returns.")
+OUT_PASSED_TWICE = ("[editor note] The command has passed twice in a row. If the task is done, stop now: answer in "
+                    "plain text with what you changed and what you checked. Do not keep editing a result that works.")
 OUT_USER_REJECT_ALL = "user rejected the edits, files unchanged"
 OUT_TAB_CLOSED_REVIEW = "tab closed during review, edit not applied"
 

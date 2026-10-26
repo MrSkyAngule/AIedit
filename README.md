@@ -184,6 +184,8 @@ The suite runs on both PyQt6 and PySide6 and uses fake providers and local HTTP 
 - Zones live next to the file, in `*.aimarks.json`. If a file is renamed or copied outside the editor, the editor
   recognizes its closed code by fingerprints (hashes of the closed lines) and keeps it hidden until you decide.
   It matches the closed part line by line: if that part was changed in the copy, it is not recognized.
+- The fingerprints in `*.aimarks.json` are plain unsalted hashes: a short line like `rate = 0.15` can be guessed
+  by brute force. Models never get these files, but do not publish them in a public repository.
 - `interface` sends the `#` comments of the zone to the model, on purpose, so it knows what the closed names mean.
   A comment can reveal as much as the code: keep secrets and client details out of comments in such zones,
   or use `hidden` there. Docstrings are not sent.
